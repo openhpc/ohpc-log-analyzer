@@ -1,22 +1,63 @@
 extern crate regex;
 
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{
+    HashMap,
+    HashSet,
+};
 use std::fs::File;
-use std::io::{BufWriter, Read, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-use std::{env, process, str};
+use std::io::{
+    Read,
+    Write,
+};
+use std::net::{
+    IpAddr,
+    Ipv4Addr,
+};
+use std::path::Path;
+use std::sync::atomic::{
+    AtomicUsize,
+    Ordering,
+};
+use std::sync::RwLock;
+use std::{
+    process,
+    str,
+};
 
-use getopts::Options;
-use plotly::layout::{Axis, BarMode, Layout};
-use plotly::{Bar, Plot, Scatter};
+use clap::Parser;
+use plotly::layout::{
+    Axis,
+    BarMode,
+    Layout,
+};
+use plotly::{
+    Bar,
+    ImageFormat,
+    Plot,
+    Scatter,
+};
 use regex::bytes::Regex;
 
 static OVERALL: AtomicUsize = AtomicUsize::new(0);
 static OHPC_1: AtomicUsize = AtomicUsize::new(0);
 static OHPC_2: AtomicUsize = AtomicUsize::new(0);
 static OHPC_3: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Name of the HTML output file
+    #[arg(long, default_value = "index.html")]
+    html_output: String,
+
+    /// Name of the HTML output file
+    #[arg(long, default_value = "/stats")]
+    output_directory: String,
+
+    /// One or multiple access logs
+    access_log: Vec<String>,
+}
 
 #[derive(Debug)]
 struct ResultOverall {
@@ -25,6 +66,30 @@ struct ResultOverall {
     ohpc_2: i64,
     ohpc_3: i64,
     overall: i64,
+    unique_ohpc_1: i64,
+    unique_ohpc_2: i64,
+    unique_ohpc_3: i64,
+    unique_overall: i64,
+    size: u64,
+    ipv4: HashSet<u32>,
+    ipv6: HashSet<u128>,
+}
+
+#[derive(Debug)]
+struct ResultOverallPerMonth {
+    year: i64,
+    month: i64,
+    ohpc_1: i64,
+    ohpc_2: i64,
+    ohpc_3: i64,
+    overall: i64,
+    unique_ohpc_1: i64,
+    unique_ohpc_2: i64,
+    unique_ohpc_3: i64,
+    unique_overall: i64,
+    size: u64,
+    ipv4: HashSet<u32>,
+    ipv6: HashSet<u128>,
 }
 
 #[derive(Debug)]
@@ -65,6 +130,7 @@ struct ResultType {
 }
 
 static OVERALL_RESULTS: RwLock<Vec<ResultOverall>> = RwLock::new(Vec::new());
+static OVERALL_RESULTS_PER_MONTH: RwLock<Vec<ResultOverallPerMonth>> = RwLock::new(Vec::new());
 static OHPC1_RESULTS: RwLock<Vec<ResultOHPC1>> = RwLock::new(Vec::new());
 static OHPC2_RESULTS: RwLock<Vec<ResultOHPC2>> = RwLock::new(Vec::new());
 static OHPC3_RESULTS: RwLock<Vec<ResultOHPC3>> = RwLock::new(Vec::new());
@@ -88,7 +154,7 @@ fn last_newline(s: &[u8]) -> usize {
     s.len()
 }
 
-fn count_type(elements: &Vec<String>, year: i64) {
+fn count_type(elements: &[String], year: i64) {
     if elements.len() < 7 {
         return;
     }
@@ -126,35 +192,36 @@ fn count_type(elements: &Vec<String>, year: i64) {
     }
 }
 
-fn count_libdnf(elements: &Vec<String>, year: i64) {
+fn count_libdnf(elements: &[String], year: i64) {
     if elements.len() < 12 {
         return;
     }
-    if elements[11] == "\"libdnf" {
-        let user_agent_long = elements[12..].join(" ");
-        let user_agent_vec: Vec<_> = user_agent_long.split(';').map(|s| s.to_string()).collect();
-        let mut user_agent_short = user_agent_vec[0].clone();
-        user_agent_short.truncate(user_agent_short.rfind(' ').unwrap());
-        let user_agent = &user_agent_short[1..];
-        if user_agent.is_empty() {
-            return;
+    if elements[11] != "\"libdnf" {
+        return;
+    }
+    let user_agent_long = elements[12..].join(" ");
+    let user_agent_vec: Vec<_> = user_agent_long.split(';').map(|s| s.to_string()).collect();
+    let mut user_agent_short = user_agent_vec[0].clone();
+    user_agent_short.truncate(user_agent_short.rfind(' ').unwrap());
+    let user_agent = &user_agent_short[1..];
+    if user_agent.is_empty() {
+        return;
+    }
+    let mut data = LIBDNF_RESULTS.write().unwrap();
+    let mut name_and_year_found = false;
+    for result in data.as_mut_slice() {
+        if result.year == year && result.name == user_agent {
+            name_and_year_found = true;
+            result.count += 1;
+            break;
         }
-        let mut data = LIBDNF_RESULTS.write().unwrap();
-        let mut name_and_year_found = false;
-        for result in data.as_mut_slice() {
-            if result.year == year && result.name == user_agent {
-                name_and_year_found = true;
-                result.count += 1;
-                break;
-            }
-        }
-        if !name_and_year_found {
-            data.push(ResultLIBDNF {
-                year,
-                name: user_agent.to_string(),
-                count: 1,
-            });
-        }
+    }
+    if !name_and_year_found {
+        data.push(ResultLIBDNF {
+            year,
+            name: user_agent.to_string(),
+            count: 1,
+        });
     }
 }
 
@@ -218,6 +285,24 @@ fn update_distributions_ohpc_3(s: &[u8], year: i64) {
     }
 }
 
+fn month_to_int(s: &str) -> i64 {
+    match s {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => 0,
+    }
+}
+
 fn process_line(s: &[u8]) {
     let line = str::from_utf8(s).unwrap();
     let elements: Vec<_> = line.split(' ').map(|s| s.to_string()).collect();
@@ -226,7 +311,19 @@ fn process_line(s: &[u8]) {
         // Skip incomplete lines
         return;
     }
-    let year = elements[3][8..12].parse::<i64>().unwrap();
+    if elements[3].len() < 8 {
+        return;
+    }
+    let year = match elements[3][8..12].parse::<i64>() {
+        Ok(y) => y,
+        _ => return,
+    };
+    let month_string = &elements[3][4..7];
+    let month = month_to_int(month_string);
+    if month == 0 {
+        return;
+    }
+
     count_libdnf(&elements, year);
     count_type(&elements, year);
     let mut ohpc_1 = false;
@@ -357,325 +454,282 @@ fn process_line(s: &[u8]) {
             update_distributions_ohpc_3(&s[start + 2..], year);
         }
     }
-    let mut data = OVERALL_RESULTS.write().unwrap();
-    let mut year_found = false;
-    for result in &*data {
-        if result.year == year {
-            year_found = true;
-            break;
+
+    let size: u64 = match elements.len() < 10 {
+        true => 0,
+        false => match elements[9].parse::<u64>() {
+            Ok(y) => y,
+            _ => 0,
+        },
+    };
+
+    let ip = match elements[0].parse::<IpAddr>() {
+        Ok(ip) => ip,
+        _ => IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+    };
+
+    {
+        let mut data = OVERALL_RESULTS.write().unwrap();
+        let mut year_found = false;
+        for result in &*data {
+            if result.year == year {
+                year_found = true;
+                break;
+            }
+        }
+        if !year_found {
+            data.push(ResultOverall {
+                year,
+                ohpc_1: match ohpc_1 {
+                    true => 1,
+                    false => 0,
+                },
+                ohpc_2: match ohpc_2 {
+                    true => 1,
+                    false => 0,
+                },
+                ohpc_3: match ohpc_3 {
+                    true => 1,
+                    false => 0,
+                },
+                overall: 1,
+                unique_ohpc_1: match ohpc_1 {
+                    true => 1,
+                    false => 0,
+                },
+                unique_ohpc_2: match ohpc_2 {
+                    true => 1,
+                    false => 0,
+                },
+                unique_ohpc_3: match ohpc_3 {
+                    true => 1,
+                    false => 0,
+                },
+                unique_overall: 1,
+                size,
+                ipv4: match &ip {
+                    IpAddr::V4(ipv4) => vec![(*ipv4).into()].into_iter().collect(),
+                    _ => vec![0].into_iter().collect(),
+                },
+                ipv6: match ip {
+                    IpAddr::V6(ipv6) => vec![ipv6.into()].into_iter().collect(),
+                    _ => vec![0].into_iter().collect(),
+                },
+            });
+        } else {
+            for result in data.as_mut_slice() {
+                if result.year == year {
+                    result.overall += 1;
+                    result.size += size;
+                    if ohpc_1 {
+                        result.ohpc_1 += 1;
+                    }
+                    if ohpc_2 {
+                        result.ohpc_2 += 1;
+                    }
+                    if ohpc_3 {
+                        result.ohpc_3 += 1;
+                    }
+                    let mut unique = false;
+                    match ip {
+                        IpAddr::V4(ipv4) => {
+                            if !result.ipv4.contains(&ipv4.into()) {
+                                result.ipv4.insert(ipv4.into());
+                                unique = true;
+                            }
+                        }
+                        IpAddr::V6(ipv6) => {
+                            if !result.ipv6.contains(&ipv6.into()) {
+                                result.ipv6.insert(ipv6.into());
+                                unique = true;
+                            }
+                        }
+                    }
+                    if unique {
+                        result.unique_overall += 1;
+                        if ohpc_1 {
+                            result.unique_ohpc_1 += 1;
+                        }
+                        if ohpc_2 {
+                            result.unique_ohpc_2 += 1;
+                        }
+                        if ohpc_3 {
+                            result.unique_ohpc_3 += 1;
+                        }
+                    }
+                    break;
+                }
+            }
         }
     }
-    if !year_found {
-        data.push(ResultOverall {
-            year,
-            ohpc_1: 0,
-            ohpc_2: 0,
-            ohpc_3: 0,
-            overall: 0,
-        })
-    }
-    for result in data.as_mut_slice() {
-        if result.year == year {
-            result.overall += 1;
-            if ohpc_1 {
-                result.ohpc_1 += 1;
+    {
+        let mut data_year_month = OVERALL_RESULTS_PER_MONTH.write().unwrap();
+        let mut year_month_found = false;
+
+        for result in &*data_year_month {
+            if result.year == year && result.month == month {
+                year_month_found = true;
+                break;
             }
-            if ohpc_2 {
-                result.ohpc_2 += 1;
+        }
+        if !year_month_found {
+            data_year_month.push(ResultOverallPerMonth {
+                year,
+                month,
+                ohpc_1: match ohpc_1 {
+                    true => 1,
+                    false => 0,
+                },
+                ohpc_2: match ohpc_2 {
+                    true => 1,
+                    false => 0,
+                },
+                ohpc_3: match ohpc_3 {
+                    true => 1,
+                    false => 0,
+                },
+                overall: 1,
+                unique_ohpc_1: match ohpc_1 {
+                    true => 1,
+                    false => 0,
+                },
+                unique_ohpc_2: match ohpc_2 {
+                    true => 1,
+                    false => 0,
+                },
+                unique_ohpc_3: match ohpc_3 {
+                    true => 1,
+                    false => 0,
+                },
+                unique_overall: 1,
+                size,
+                ipv4: match &ip {
+                    IpAddr::V4(ipv4) => vec![(*ipv4).into()].into_iter().collect(),
+                    _ => vec![0].into_iter().collect(),
+                },
+                ipv6: match ip {
+                    IpAddr::V6(ipv6) => vec![ipv6.into()].into_iter().collect(),
+                    _ => vec![0].into_iter().collect(),
+                },
+            })
+        } else {
+            for result in data_year_month.as_mut_slice() {
+                if result.year == year && result.month == month {
+                    result.overall += 1;
+                    result.size += size;
+                    if ohpc_1 {
+                        result.ohpc_1 += 1;
+                    }
+                    if ohpc_2 {
+                        result.ohpc_2 += 1;
+                    }
+                    if ohpc_3 {
+                        result.ohpc_3 += 1;
+                    }
+                    let mut unique = false;
+                    match ip {
+                        IpAddr::V4(ipv4) => {
+                            if !result.ipv4.contains(&ipv4.into()) {
+                                result.ipv4.insert(ipv4.into());
+                                unique = true;
+                            }
+                        }
+                        IpAddr::V6(ipv6) => {
+                            if !result.ipv6.contains(&ipv6.into()) {
+                                result.ipv6.insert(ipv6.into());
+                                unique = true;
+                            }
+                        }
+                    }
+                    if unique {
+                        result.unique_overall += 1;
+                        if ohpc_1 {
+                            result.unique_ohpc_1 += 1;
+                        }
+                        if ohpc_2 {
+                            result.unique_ohpc_2 += 1;
+                        }
+                        if ohpc_3 {
+                            result.unique_ohpc_3 += 1;
+                        }
+                    }
+                    break;
+                }
             }
-            if ohpc_3 {
-                result.ohpc_3 += 1;
-            }
-            break;
         }
     }
 }
 
 const CHUNK_SIZE: usize = 100_000_000;
 
-struct Parameters {
-    access_log: String,
-    repomd_log: String,
-    aarch64_log: String,
-    x86_64_log: String,
-    overall_log: String,
-    html_output: String,
-}
-
-fn setup_params() -> Parameters {
-    let args: Vec<String> = env::args().collect();
-    let program = args[0].clone();
-    let mut opts = Options::new();
-    let mut params = Parameters {
-        access_log: String::new(),
-        repomd_log: String::from("repomd.log"),
-        aarch64_log: String::from("aarch64.log"),
-        x86_64_log: String::from("x86_64.log"),
-        overall_log: String::from("overall.log"),
-        html_output: String::from("ohpc-statistics.html"),
-    };
-
-    opts.optmulti("", "access-log", "input file (httpd log file)", "");
-    opts.optmulti(
-        "",
-        "repomd",
-        &format!("output file - only repomd accesses ({})", params.repomd_log),
-        "",
-    );
-
-    opts.optmulti(
-        "",
-        "aarch64",
-        &format!(
-            "output file - only aarch64 accesses ({})",
-            params.aarch64_log
-        ),
-        "",
-    );
-
-    opts.optmulti(
-        "",
-        "x86-64",
-        &format!("output file - only x86_64 accesses ({})", params.x86_64_log),
-        "",
-    );
-
-    opts.optmulti(
-        "",
-        "overall",
-        &format!("output file - all accesses ({})", params.overall_log),
-        "",
-    );
-
-    opts.optmulti(
-        "",
-        "html-output",
-        &format!("html output file ({})", params.html_output),
-        "",
-    );
-
-    let matches = match opts.parse(&args[1..]) {
-        Ok(m) => m,
-        _ => {
-            print!(
-                "{}",
-                opts.usage(format!("Usage: {} [options]", program).as_str())
-            );
-            process::exit(0);
-        }
-    };
-
-    if matches.opt_present("access-log") {
-        params.access_log =
-            matches.opt_strs("access-log")[matches.opt_count("access-log") - 1].to_string();
-    }
-
-    if matches.opt_present("repomd") {
-        params.repomd_log = matches.opt_strs("repomd")[matches.opt_count("repomd") - 1].to_string();
-    }
-
-    if matches.opt_present("aarch64") {
-        params.aarch64_log =
-            matches.opt_strs("aarch64")[matches.opt_count("aarch64") - 1].to_string();
-    }
-
-    if matches.opt_present("x86-64") {
-        params.x86_64_log = matches.opt_strs("x86-64")[matches.opt_count("x86-64") - 1].to_string();
-    }
-
-    if matches.opt_present("overall") {
-        params.overall_log =
-            matches.opt_strs("overall")[matches.opt_count("overall") - 1].to_string();
-    }
-
-    if matches.opt_present("html-output") {
-        params.html_output =
-            matches.opt_strs("html-output")[matches.opt_count("html-output") - 1].to_string();
-    }
-
-    params
-}
-
 fn main() {
-    let params = setup_params();
+    let params = Args::parse();
+    let output = Path::new(&params.output_directory).join(&params.html_output);
+    println!("Using '{}' as html output", output.display());
     let pool = rayon::ThreadPoolBuilder::new().build().unwrap();
-    let repomd_xml_log_file: Arc<Mutex<BufWriter<File>>> = Arc::new({
-        let file = match File::create(params.repomd_log.clone()) {
-            Ok(r) => r,
+
+    for input in params.access_log.clone().into_iter() {
+        let mut access_log = match std::fs::File::open(input.clone()) {
+            Ok(a) => a,
             Err(e) => {
-                println!(
-                    "Creating repomd output file '{}' failed: {}",
-                    params.repomd_log, e
-                );
+                println!("Opening input file '{}' failed: {}", input, e);
                 process::exit(1);
             }
         };
-        BufWriter::new(file).into()
-    });
-    let aarch64_log_file: Arc<Mutex<BufWriter<File>>> = Arc::new({
-        let file = match File::create(params.aarch64_log.clone()) {
-            Ok(r) => r,
-            Err(e) => {
-                println!(
-                    "Creating aarch64 output file '{}' failed: {}",
-                    params.aarch64_log, e
-                );
-                process::exit(1);
-            }
-        };
-        BufWriter::new(file).into()
-    });
-
-    let x86_64_log_file: Arc<Mutex<BufWriter<File>>> = Arc::new({
-        let file = match File::create(params.x86_64_log.clone()) {
-            Ok(r) => r,
-            Err(e) => {
-                println!(
-                    "Creating x86_64 output file '{}' failed: {}",
-                    params.x86_64_log, e
-                );
-                process::exit(1);
-            }
-        };
-        BufWriter::new(file).into()
-    });
-
-    let overall_log_file: Arc<Mutex<BufWriter<File>>> = Arc::new({
-        let file = match File::create(params.overall_log.clone()) {
-            Ok(r) => r,
-            Err(e) => {
-                println!(
-                    "Creating overall output file '{}' failed: {}",
-                    params.overall_log, e
-                );
-                process::exit(1);
-            }
-        };
-        BufWriter::new(file).into()
-    });
-
-    let mut access_log = match std::fs::File::open(params.access_log.clone()) {
-        Ok(a) => a,
-        Err(e) => {
-            println!("Opening input file '{}' failed: {}", params.access_log, e);
-            process::exit(1);
-        }
-    };
-    println!("Using '{}' as input", params.access_log);
-    println!("Using '{}' as repomd output", params.repomd_log);
-    println!("Using '{}' as aarch64 output", params.aarch64_log);
-    println!("Using '{}' as x86_64 output", params.x86_64_log);
-    println!("Using '{}' as overall output", params.overall_log);
-    pool.scope(|scope| {
-        let mut s = Vec::with_capacity(CHUNK_SIZE);
-        loop {
-            std::io::Read::by_ref(&mut access_log)
-                .take((CHUNK_SIZE - s.len()) as u64)
-                .read_to_end(&mut s)
-                .unwrap();
-
-            if s.is_empty() {
-                // The file has ended.
-                break;
-            }
-
-            // Copy any incomplete lines to the next s.
-            let last_newline = last_newline(&s);
-            let mut next_s = Vec::with_capacity(CHUNK_SIZE);
-            next_s.extend_from_slice(&s[last_newline..]);
-            s.truncate(last_newline);
-
+        println!("Using '{:}' as input", input);
+        pool.scope(|scope| {
+            let mut s = Vec::with_capacity(CHUNK_SIZE);
             loop {
-                // Do not spawn any more threads if the queue is already full.
-                if !pool.current_thread_has_pending_tasks().unwrap() {
+                std::io::Read::by_ref(&mut access_log)
+                    .take((CHUNK_SIZE - s.len()) as u64)
+                    .read_to_end(&mut s)
+                    .unwrap();
+
+                if s.is_empty() {
+                    // The file has ended.
                     break;
                 }
+
+                // Copy any incomplete lines to the next s.
+                let last_newline = last_newline(&s);
+                let mut next_s = Vec::with_capacity(CHUNK_SIZE);
+                next_s.extend_from_slice(&s[last_newline..]);
+                s.truncate(last_newline);
+
+                loop {
+                    // Do not spawn any more threads if the queue is already full.
+                    if !pool.current_thread_has_pending_tasks().unwrap() {
+                        break;
+                    }
+                }
+
+                // Move our string into a rayon thread.
+                let data = s;
+                scope.spawn(move |_| {
+                    let re = Regex::new(r"(.*GET.*){2,}").unwrap();
+                    let d_s = data[..last_newline].split(|c| *c == b'\n');
+
+                    for i in d_s {
+                        let mut search = i.windows(3).position(|window| window == b"png");
+                        if search.is_some() {
+                            continue;
+                        }
+                        search = i.windows(3).position(|window| window == b"gif");
+                        if search.is_some() {
+                            continue;
+                        }
+                        if re.is_match(i) {
+                            // Skip broken lines with two or more "GET"s
+                            continue;
+                        }
+                        process_line(i);
+                    }
+                });
+                s = next_s;
             }
-
-            // Move our string into a rayon thread.
-            let data = s;
-            let repomd_xml_log_file = Arc::clone(&repomd_xml_log_file);
-            let aarch64_log_file = Arc::clone(&aarch64_log_file);
-            let x86_64_log_file = Arc::clone(&x86_64_log_file);
-            let overall_log_file = Arc::clone(&overall_log_file);
-            scope.spawn(move |_| {
-                let re = Regex::new(r"\[\d{2}\/").unwrap();
-                let mut repomd_xml_content = String::new();
-                let mut aarch64_content = String::new();
-                let mut x86_64_content = String::new();
-                let mut overall_content = String::new();
-                let d_s = data[..last_newline].split(|c| *c == b'\n');
-
-                let substring_repomd_xml = "/repomd.xml".as_bytes();
-                let substring_aarch64 = ".aarch64.".as_bytes();
-                let substring_x86_64 = ".x86_64.".as_bytes();
-                for i in d_s {
-                    let mut search = i.windows(3).position(|window| window == b"png");
-                    if search.is_some() {
-                        continue;
-                    }
-                    search = i.windows(3).position(|window| window == b"gif");
-                    if search.is_some() {
-                        continue;
-                    }
-                    let j = re.replace_all(i, b"[01/");
-                    search = j
-                        .windows(substring_repomd_xml.len())
-                        .position(|window| window == substring_repomd_xml);
-
-                    if search.is_some() {
-                        repomd_xml_content += str::from_utf8(&j).unwrap();
-                        repomd_xml_content += "\n";
-                    }
-
-                    search = j
-                        .windows(substring_aarch64.len())
-                        .position(|window| window == substring_aarch64);
-
-                    if search.is_some() {
-                        aarch64_content += str::from_utf8(&j).unwrap();
-                        aarch64_content += "\n";
-                    }
-
-                    search = j
-                        .windows(substring_x86_64.len())
-                        .position(|window| window == substring_x86_64);
-
-                    if search.is_some() {
-                        x86_64_content += str::from_utf8(&j).unwrap();
-                        x86_64_content += "\n";
-                    }
-
-                    overall_content += str::from_utf8(&j).unwrap();
-                    overall_content += "\n";
-
-                    process_line(&j);
-                }
-
-                let mut log_file = repomd_xml_log_file.lock().unwrap();
-                if let Err(e) = log_file.write_all(repomd_xml_content.as_bytes()) {
-                    println!("Error writing to repomd specific log file: {}", e);
-                }
-
-                log_file = aarch64_log_file.lock().unwrap();
-                if let Err(e) = log_file.write_all(aarch64_content.as_bytes()) {
-                    println!("Error writing to aarch64 specific log file: {}", e);
-                }
-
-                log_file = x86_64_log_file.lock().unwrap();
-                if let Err(e) = log_file.write_all(x86_64_content.as_bytes()) {
-                    println!("Error writing to x86_64 specific log file: {}", e);
-                }
-
-                log_file = overall_log_file.lock().unwrap();
-                if let Err(e) = log_file.write_all(overall_content.as_bytes()) {
-                    println!("Error writing to overall log file: {}", e);
-                }
-            });
-            s = next_s;
-        }
-    });
-    if let Err(e) = create_plots(params.html_output) {
+        });
+    }
+    if let Err(e) = create_plots(params) {
         println!("Error creating diagrams: {}", e);
         process::exit(1);
     }
@@ -752,12 +806,17 @@ fn create_type_plot() -> String {
     plot.to_inline_html(None)
 }
 
-fn create_plots(output: String) -> Result<(), Box<dyn std::error::Error>> {
+fn create_plots(params: Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut ohpc_1: Vec<i64> = Vec::new();
     let mut ohpc_2: Vec<i64> = Vec::new();
     let mut ohpc_3: Vec<i64> = Vec::new();
     let mut overall: Vec<i64> = Vec::new();
+    let mut unique_ohpc_1: Vec<i64> = Vec::new();
+    let mut unique_ohpc_2: Vec<i64> = Vec::new();
+    let mut unique_ohpc_3: Vec<i64> = Vec::new();
+    let mut unique_overall: Vec<i64> = Vec::new();
     let mut ticks: Vec<f64> = Vec::new();
+    let mut size: Vec<u64> = Vec::new();
 
     let mut years: Vec<i64> = Vec::new();
     let data = OVERALL_RESULTS.read().unwrap();
@@ -773,7 +832,12 @@ fn create_plots(output: String) -> Result<(), Box<dyn std::error::Error>> {
                 ohpc_2.push(result.ohpc_2);
                 ohpc_3.push(result.ohpc_3);
                 overall.push(result.overall);
+                unique_ohpc_1.push(result.unique_ohpc_1);
+                unique_ohpc_2.push(result.unique_ohpc_2);
+                unique_ohpc_3.push(result.unique_ohpc_3);
+                unique_overall.push(result.unique_overall);
                 ticks.push((*year) as f64);
+                size.push(result.size);
                 break;
             }
         }
@@ -792,6 +856,112 @@ fn create_plots(output: String) -> Result<(), Box<dyn std::error::Error>> {
         .title("OHPC repository requests per year".into())
         .x_axis(Axis::new().tick_values(ticks.clone()));
     plot.set_layout(layout);
+
+    let mut unique_plot = Plot::new();
+    let trace_unique_ohpc_1 = Scatter::new(years.clone(), unique_ohpc_1).name("OHPC 1.3.x");
+    let trace_unique_ohpc_2 = Scatter::new(years.clone(), unique_ohpc_2).name("OHPC 2.x");
+    let trace_unique_ohpc_3 = Scatter::new(years.clone(), unique_ohpc_3).name("OHPC 3.x");
+    let trace_unique_overall = Scatter::new(years.clone(), unique_overall).name("Total");
+    unique_plot.add_trace(trace_unique_ohpc_1);
+    unique_plot.add_trace(trace_unique_ohpc_2);
+    unique_plot.add_trace(trace_unique_ohpc_3);
+    unique_plot.add_trace(trace_unique_overall);
+    let unique_layout = Layout::new()
+        .title("Unique OHPC repository requests per year".into())
+        .x_axis(Axis::new().tick_values(ticks.clone()));
+    unique_plot.set_layout(unique_layout);
+    let mut output = Path::new(&params.output_directory).join("unique_visitors_per_year.svg");
+    unique_plot.write_image(output, ImageFormat::SVG, 1600, 600, 1.0);
+
+    let mut plot_size_per_year = Plot::new();
+    let size_per_year = Scatter::new(years.clone(), size).name("Total");
+    plot_size_per_year.add_trace(size_per_year);
+    let layout_size_per_year = Layout::new()
+        .title("OHPC data downloaded per year".into())
+        .x_axis(Axis::new().tick_values(ticks.clone()));
+    plot_size_per_year.set_layout(layout_size_per_year);
+
+    output = Path::new(&params.output_directory).join("size_per_year.svg");
+    plot_size_per_year.write_image(output, ImageFormat::SVG, 1600, 600, 1.0);
+
+    let mut ohpc_1_per_month: Vec<i64> = Vec::new();
+    let mut ohpc_2_per_month: Vec<i64> = Vec::new();
+    let mut ohpc_3_per_month: Vec<i64> = Vec::new();
+    let mut overall_per_month: Vec<i64> = Vec::new();
+    let mut unique_ohpc_1_per_month: Vec<i64> = Vec::new();
+    let mut unique_ohpc_2_per_month: Vec<i64> = Vec::new();
+    let mut unique_ohpc_3_per_month: Vec<i64> = Vec::new();
+    let mut unique_overall_per_month: Vec<i64> = Vec::new();
+    let mut size_per_month: Vec<u64> = Vec::new();
+
+    let mut year_months: Vec<String> = Vec::new();
+    let data = OVERALL_RESULTS_PER_MONTH.read().unwrap();
+    for result in &*data {
+        year_months.push(format!("{}-{:02}", result.year, result.month));
+    }
+    year_months.sort_unstable();
+
+    for year_month in &year_months {
+        for result in &*data {
+            if format!("{}-{:02}", result.year, result.month) == *year_month {
+                ohpc_1_per_month.push(result.ohpc_1);
+                ohpc_2_per_month.push(result.ohpc_2);
+                ohpc_3_per_month.push(result.ohpc_3);
+                overall_per_month.push(result.overall);
+                unique_ohpc_1_per_month.push(result.unique_ohpc_1);
+                unique_ohpc_2_per_month.push(result.unique_ohpc_2);
+                unique_ohpc_3_per_month.push(result.unique_ohpc_3);
+                unique_overall_per_month.push(result.unique_overall);
+                size_per_month.push(result.size);
+                break;
+            }
+        }
+    }
+
+    let mut plot_overall_per_month = Plot::new();
+    let trace_ohpc_1_per_month =
+        Scatter::new(year_months.clone(), ohpc_1_per_month).name("OHPC 1.3.x");
+    let trace_ohpc_2_per_month =
+        Scatter::new(year_months.clone(), ohpc_2_per_month).name("OHPC 2.x");
+    let trace_ohpc_3_per_month =
+        Scatter::new(year_months.clone(), ohpc_3_per_month).name("OHPC 3.x");
+    let trace_overall_per_month =
+        Scatter::new(year_months.clone(), overall_per_month).name("Total");
+    plot_overall_per_month.add_trace(trace_ohpc_1_per_month);
+    plot_overall_per_month.add_trace(trace_ohpc_2_per_month);
+    plot_overall_per_month.add_trace(trace_ohpc_3_per_month);
+    plot_overall_per_month.add_trace(trace_overall_per_month);
+    let layout_overall_per_month = Layout::new().title("OHPC repository requests per month".into());
+    plot_overall_per_month.set_layout(layout_overall_per_month);
+
+    let mut plot_unique_per_month = Plot::new();
+    let trace_unique_ohpc_1_per_month =
+        Scatter::new(year_months.clone(), unique_ohpc_1_per_month).name("OHPC 1.3.x");
+    let trace_unique_ohpc_2_per_month =
+        Scatter::new(year_months.clone(), unique_ohpc_2_per_month).name("OHPC 2.x");
+    let trace_unique_ohpc_3_per_month =
+        Scatter::new(year_months.clone(), unique_ohpc_3_per_month).name("OHPC 3.x");
+    let trace_unique_overall_per_month =
+        Scatter::new(year_months.clone(), unique_overall_per_month).name("Total");
+    plot_unique_per_month.add_trace(trace_unique_ohpc_1_per_month);
+    plot_unique_per_month.add_trace(trace_unique_ohpc_2_per_month);
+    plot_unique_per_month.add_trace(trace_unique_ohpc_3_per_month);
+    plot_unique_per_month.add_trace(trace_unique_overall_per_month);
+    let layout_unique_per_month =
+        Layout::new().title("Unique OHPC repository requests per month".into());
+    plot_unique_per_month.set_layout(layout_unique_per_month);
+    output = Path::new(&params.output_directory).join("unique_visitors_per_month.svg");
+    plot_unique_per_month.write_image(output, ImageFormat::SVG, 1600, 600, 1.0);
+
+    let mut plot_size_per_month = Plot::new();
+    let size_per_month = Scatter::new(year_months.clone(), size_per_month).name("Total");
+    plot_size_per_month.add_trace(size_per_month);
+    let layout_size_per_month = Layout::new().title("OHPC data downloaded per month".into());
+    plot_size_per_month.set_layout(layout_size_per_month);
+
+    output = Path::new(&params.output_directory).join("size_per_month.svg");
+    plot_size_per_month.write_image(output, ImageFormat::SVG, 1600, 600, 1.0);
+
     let mut ohpc_1_sles: Vec<i64> = Vec::new();
     let mut ohpc_1_rhel: Vec<i64> = Vec::new();
     let data_ohpc_1 = OHPC1_RESULTS.read().unwrap();
@@ -923,9 +1093,15 @@ fn create_plots(output: String) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     {
+        output = Path::new(&params.output_directory).join(params.html_output);
         let mut file = File::create(output).unwrap();
         file.write_all(HTML_HEADER.as_bytes())?;
         file.write_all(plot.to_inline_html(None).as_bytes())?;
+        file.write_all(unique_plot.to_inline_html(None).as_bytes())?;
+        file.write_all(plot_overall_per_month.to_inline_html(None).as_bytes())?;
+        file.write_all(plot_unique_per_month.to_inline_html(None).as_bytes())?;
+        file.write_all(plot_size_per_year.to_inline_html(None).as_bytes())?;
+        file.write_all(plot_size_per_month.to_inline_html(None).as_bytes())?;
         file.write_all(plot_ohpc_1.to_inline_html(None).as_bytes())?;
         file.write_all(plot_libdnf.to_inline_html(None).as_bytes())?;
         file.write_all(create_overall_plot().as_bytes())?;
