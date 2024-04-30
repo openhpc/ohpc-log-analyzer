@@ -1,4 +1,5 @@
 extern crate regex;
+extern crate serde;
 
 use std::collections::hash_map::Entry;
 use std::collections::{
@@ -38,6 +39,7 @@ use plotly::{
     Scatter,
 };
 use regex::bytes::Regex;
+use serde::Serialize;
 
 static OVERALL: AtomicUsize = AtomicUsize::new(0);
 static OHPC_1: AtomicUsize = AtomicUsize::new(0);
@@ -54,6 +56,10 @@ struct Args {
     /// Name of the HTML output file
     #[arg(long, default_value = "/stats")]
     output_directory: String,
+
+    /// Do not write svg output files
+    #[arg(long, default_value = "false")]
+    no_svg: bool,
 
     /// One or multiple access logs
     access_log: Vec<String>,
@@ -127,6 +133,41 @@ struct ResultType {
     tar: i64,
     rpm: i64,
     repomd_xml: i64,
+}
+
+#[derive(Serialize)]
+struct UniqueVisitorsPerYear {
+    year: i64,
+    ohpc1: i64,
+    ohpc2: i64,
+    ohpc3: i64,
+    overall: i64,
+}
+#[derive(Serialize)]
+struct UniqueVisitorsPerMonth {
+    year_month: String,
+    ohpc1: i64,
+    ohpc2: i64,
+    ohpc3: i64,
+    overall: i64,
+}
+#[derive(Serialize)]
+struct SizePerYear {
+    year: i64,
+    size: u64,
+}
+#[derive(Serialize)]
+struct SizePerMonth {
+    year_month: String,
+    size: u64,
+}
+
+#[derive(Serialize)]
+struct Json {
+    unique_visitors_per_year: Vec<UniqueVisitorsPerYear>,
+    unique_visitors_per_month: Vec<UniqueVisitorsPerMonth>,
+    size_per_year: Vec<SizePerYear>,
+    size_per_month: Vec<SizePerMonth>,
 }
 
 static OVERALL_RESULTS: RwLock<Vec<ResultOverall>> = RwLock::new(Vec::new());
@@ -665,6 +706,7 @@ const CHUNK_SIZE: usize = 100_000_000;
 fn main() {
     let params = Args::parse();
     let output = Path::new(&params.output_directory).join(&params.html_output);
+    println!("Using '{}' as output directory", params.output_directory);
     println!("Using '{}' as html output", output.display());
     let pool = rayon::ThreadPoolBuilder::new().build().unwrap();
 
@@ -806,56 +848,84 @@ fn create_type_plot() -> String {
     plot.to_inline_html(None)
 }
 
-fn create_plots(params: Args) -> Result<(), Box<dyn std::error::Error>> {
-    let mut ohpc_1: Vec<i64> = Vec::new();
-    let mut ohpc_2: Vec<i64> = Vec::new();
-    let mut ohpc_3: Vec<i64> = Vec::new();
-    let mut overall: Vec<i64> = Vec::new();
-    let mut unique_ohpc_1: Vec<i64> = Vec::new();
-    let mut unique_ohpc_2: Vec<i64> = Vec::new();
-    let mut unique_ohpc_3: Vec<i64> = Vec::new();
-    let mut unique_overall: Vec<i64> = Vec::new();
-    let mut ticks: Vec<f64> = Vec::new();
-    let mut size: Vec<u64> = Vec::new();
-
-    let mut years: Vec<i64> = Vec::new();
-    let data = OVERALL_RESULTS.read().unwrap();
+fn get_years(years: &mut Vec<i64>) -> Result<(), Box<dyn std::error::Error>> {
+    let data = OVERALL_RESULTS.read()?;
     for result in &*data {
         years.push(result.year);
     }
     years.sort_unstable();
 
-    for year in &years {
+    Ok(())
+}
+
+fn create_repository_requests_per_year(
+    years: &Vec<i64>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut ohpc_1: Vec<i64> = Vec::new();
+    let mut ohpc_2: Vec<i64> = Vec::new();
+    let mut ohpc_3: Vec<i64> = Vec::new();
+    let mut overall: Vec<i64> = Vec::new();
+    let mut ticks: Vec<f64> = Vec::new();
+    let data = OVERALL_RESULTS.read()?;
+
+    for year in years {
         for result in &*data {
             if result.year == *year {
                 ohpc_1.push(result.ohpc_1);
                 ohpc_2.push(result.ohpc_2);
                 ohpc_3.push(result.ohpc_3);
                 overall.push(result.overall);
-                unique_ohpc_1.push(result.unique_ohpc_1);
-                unique_ohpc_2.push(result.unique_ohpc_2);
-                unique_ohpc_3.push(result.unique_ohpc_3);
-                unique_overall.push(result.unique_overall);
                 ticks.push((*year) as f64);
-                size.push(result.size);
                 break;
             }
         }
     }
 
     let mut plot = Plot::new();
-    let trace_ohpc_1 = Scatter::new(years.clone(), ohpc_1).name("OHPC 1.3.x");
-    let trace_ohpc_2 = Scatter::new(years.clone(), ohpc_2).name("OHPC 2.x");
-    let trace_ohpc_3 = Scatter::new(years.clone(), ohpc_3).name("OHPC 3.x");
-    let trace_overall = Scatter::new(years.clone(), overall).name("Total");
-    plot.add_trace(trace_ohpc_1);
-    plot.add_trace(trace_ohpc_2);
-    plot.add_trace(trace_ohpc_3);
-    plot.add_trace(trace_overall);
-    let layout = Layout::new()
-        .title("OHPC repository requests per year".into())
-        .x_axis(Axis::new().tick_values(ticks.clone()));
-    plot.set_layout(layout);
+    plot.add_trace(Scatter::new(years.clone(), ohpc_1).name("OHPC 1.3.x"));
+    plot.add_trace(Scatter::new(years.clone(), ohpc_2).name("OHPC 2.x"));
+    plot.add_trace(Scatter::new(years.clone(), ohpc_3).name("OHPC 3.x"));
+    plot.add_trace(Scatter::new(years.clone(), overall).name("Total"));
+    plot.set_layout(
+        Layout::new()
+            .title("OHPC repository requests per year".into())
+            .x_axis(Axis::new().tick_values(ticks.clone())),
+    );
+
+    Ok(plot.to_inline_html(None))
+}
+
+fn create_unique_repository_requests_per_year(
+    years: &Vec<i64>,
+    params: &Args,
+    json: &mut Json,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut unique_ohpc_1: Vec<i64> = Vec::new();
+    let mut unique_ohpc_2: Vec<i64> = Vec::new();
+    let mut unique_ohpc_3: Vec<i64> = Vec::new();
+    let mut unique_overall: Vec<i64> = Vec::new();
+    let mut ticks: Vec<f64> = Vec::new();
+
+    let data = OVERALL_RESULTS.read()?;
+    for year in years {
+        for result in &*data {
+            if result.year == *year {
+                unique_ohpc_1.push(result.unique_ohpc_1);
+                unique_ohpc_2.push(result.unique_ohpc_2);
+                unique_ohpc_3.push(result.unique_ohpc_3);
+                unique_overall.push(result.unique_overall);
+                ticks.push((*year) as f64);
+                json.unique_visitors_per_year.push(UniqueVisitorsPerYear {
+                    year: *year,
+                    ohpc1: result.unique_ohpc_1,
+                    ohpc2: result.unique_ohpc_2,
+                    ohpc3: result.unique_ohpc_3,
+                    overall: result.unique_overall,
+                });
+                break;
+            }
+        }
+    }
 
     let mut unique_plot = Plot::new();
     let trace_unique_ohpc_1 = Scatter::new(years.clone(), unique_ohpc_1).name("OHPC 1.3.x");
@@ -870,8 +940,41 @@ fn create_plots(params: Args) -> Result<(), Box<dyn std::error::Error>> {
         .title("Unique OHPC repository requests per year".into())
         .x_axis(Axis::new().tick_values(ticks.clone()));
     unique_plot.set_layout(unique_layout);
-    let mut output = Path::new(&params.output_directory).join("unique_visitors_per_year.svg");
-    unique_plot.write_image(output, ImageFormat::SVG, 1600, 600, 1.0);
+    if !params.no_svg {
+        unique_plot.write_image(
+            Path::new(&params.output_directory).join("unique_visitors_per_year.svg"),
+            ImageFormat::SVG,
+            1600,
+            600,
+            1.0,
+        );
+    }
+
+    Ok(unique_plot.to_inline_html(None))
+}
+
+fn create_data_downloaded_per_year(
+    years: &Vec<i64>,
+    params: &Args,
+    json: &mut Json,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut ticks: Vec<f64> = Vec::new();
+    let mut size: Vec<u64> = Vec::new();
+    let data = OVERALL_RESULTS.read()?;
+
+    for year in years {
+        for result in &*data {
+            if result.year == *year {
+                size.push(result.size);
+                ticks.push((*year) as f64);
+                json.size_per_year.push(SizePerYear {
+                    year: *year,
+                    size: result.size,
+                });
+                break;
+            }
+        }
+    }
 
     let mut plot_size_per_year = Plot::new();
     let size_per_year = Scatter::new(years.clone(), size).name("Total");
@@ -881,21 +984,27 @@ fn create_plots(params: Args) -> Result<(), Box<dyn std::error::Error>> {
         .x_axis(Axis::new().tick_values(ticks.clone()));
     plot_size_per_year.set_layout(layout_size_per_year);
 
-    output = Path::new(&params.output_directory).join("size_per_year.svg");
-    plot_size_per_year.write_image(output, ImageFormat::SVG, 1600, 600, 1.0);
+    if !params.no_svg {
+        plot_size_per_year.write_image(
+            Path::new(&params.output_directory).join("size_per_year.svg"),
+            ImageFormat::SVG,
+            1600,
+            600,
+            1.0,
+        );
+    }
 
+    Ok(plot_size_per_year.to_inline_html(None))
+}
+
+fn create_repository_requests_per_month() -> Result<String, Box<dyn std::error::Error>> {
     let mut ohpc_1_per_month: Vec<i64> = Vec::new();
     let mut ohpc_2_per_month: Vec<i64> = Vec::new();
     let mut ohpc_3_per_month: Vec<i64> = Vec::new();
     let mut overall_per_month: Vec<i64> = Vec::new();
-    let mut unique_ohpc_1_per_month: Vec<i64> = Vec::new();
-    let mut unique_ohpc_2_per_month: Vec<i64> = Vec::new();
-    let mut unique_ohpc_3_per_month: Vec<i64> = Vec::new();
-    let mut unique_overall_per_month: Vec<i64> = Vec::new();
-    let mut size_per_month: Vec<u64> = Vec::new();
-
     let mut year_months: Vec<String> = Vec::new();
-    let data = OVERALL_RESULTS_PER_MONTH.read().unwrap();
+
+    let data = OVERALL_RESULTS_PER_MONTH.read()?;
     for result in &*data {
         year_months.push(format!("{}-{:02}", result.year, result.month));
     }
@@ -908,64 +1017,89 @@ fn create_plots(params: Args) -> Result<(), Box<dyn std::error::Error>> {
                 ohpc_2_per_month.push(result.ohpc_2);
                 ohpc_3_per_month.push(result.ohpc_3);
                 overall_per_month.push(result.overall);
-                unique_ohpc_1_per_month.push(result.unique_ohpc_1);
-                unique_ohpc_2_per_month.push(result.unique_ohpc_2);
-                unique_ohpc_3_per_month.push(result.unique_ohpc_3);
-                unique_overall_per_month.push(result.unique_overall);
-                size_per_month.push(result.size);
                 break;
             }
         }
     }
 
     let mut plot_overall_per_month = Plot::new();
-    let trace_ohpc_1_per_month =
-        Scatter::new(year_months.clone(), ohpc_1_per_month).name("OHPC 1.3.x");
-    let trace_ohpc_2_per_month =
-        Scatter::new(year_months.clone(), ohpc_2_per_month).name("OHPC 2.x");
-    let trace_ohpc_3_per_month =
-        Scatter::new(year_months.clone(), ohpc_3_per_month).name("OHPC 3.x");
-    let trace_overall_per_month =
-        Scatter::new(year_months.clone(), overall_per_month).name("Total");
-    plot_overall_per_month.add_trace(trace_ohpc_1_per_month);
-    plot_overall_per_month.add_trace(trace_ohpc_2_per_month);
-    plot_overall_per_month.add_trace(trace_ohpc_3_per_month);
-    plot_overall_per_month.add_trace(trace_overall_per_month);
-    let layout_overall_per_month = Layout::new().title("OHPC repository requests per month".into());
-    plot_overall_per_month.set_layout(layout_overall_per_month);
+    plot_overall_per_month
+        .add_trace(Scatter::new(year_months.clone(), ohpc_1_per_month).name("OHPC 1.3.x"));
+    plot_overall_per_month
+        .add_trace(Scatter::new(year_months.clone(), ohpc_2_per_month).name("OHPC 2.x"));
+    plot_overall_per_month
+        .add_trace(Scatter::new(year_months.clone(), ohpc_3_per_month).name("OHPC 3.x"));
+    plot_overall_per_month
+        .add_trace(Scatter::new(year_months.clone(), overall_per_month).name("Total"));
+    plot_overall_per_month
+        .set_layout(Layout::new().title("OHPC repository requests per month".into()));
 
-    let mut plot_unique_per_month = Plot::new();
-    let trace_unique_ohpc_1_per_month =
-        Scatter::new(year_months.clone(), unique_ohpc_1_per_month).name("OHPC 1.3.x");
-    let trace_unique_ohpc_2_per_month =
-        Scatter::new(year_months.clone(), unique_ohpc_2_per_month).name("OHPC 2.x");
-    let trace_unique_ohpc_3_per_month =
-        Scatter::new(year_months.clone(), unique_ohpc_3_per_month).name("OHPC 3.x");
-    let trace_unique_overall_per_month =
-        Scatter::new(year_months.clone(), unique_overall_per_month).name("Total");
-    plot_unique_per_month.add_trace(trace_unique_ohpc_1_per_month);
-    plot_unique_per_month.add_trace(trace_unique_ohpc_2_per_month);
-    plot_unique_per_month.add_trace(trace_unique_ohpc_3_per_month);
-    plot_unique_per_month.add_trace(trace_unique_overall_per_month);
-    let layout_unique_per_month =
-        Layout::new().title("Unique OHPC repository requests per month".into());
-    plot_unique_per_month.set_layout(layout_unique_per_month);
-    output = Path::new(&params.output_directory).join("unique_visitors_per_month.svg");
-    plot_unique_per_month.write_image(output, ImageFormat::SVG, 1600, 600, 1.0);
+    Ok(plot_overall_per_month.to_inline_html(None))
+}
 
-    let mut plot_size_per_month = Plot::new();
-    let size_per_month = Scatter::new(year_months.clone(), size_per_month).name("Total");
-    plot_size_per_month.add_trace(size_per_month);
-    let layout_size_per_month = Layout::new().title("OHPC data downloaded per month".into());
-    plot_size_per_month.set_layout(layout_size_per_month);
+fn create_unique_repository_requests_per_month(
+    params: &Args,
+    json: &mut Json,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut unique_ohpc_1_per_month: Vec<i64> = Vec::new();
+    let mut unique_ohpc_2_per_month: Vec<i64> = Vec::new();
+    let mut unique_ohpc_3_per_month: Vec<i64> = Vec::new();
+    let mut unique_overall_per_month: Vec<i64> = Vec::new();
+    let mut year_months: Vec<String> = Vec::new();
 
-    output = Path::new(&params.output_directory).join("size_per_month.svg");
-    plot_size_per_month.write_image(output, ImageFormat::SVG, 1600, 600, 1.0);
+    let data = OVERALL_RESULTS_PER_MONTH.read()?;
+    for result in &*data {
+        year_months.push(format!("{}-{:02}", result.year, result.month));
+    }
+    year_months.sort_unstable();
 
+    for year_month in &year_months {
+        for result in &*data {
+            if format!("{}-{:02}", result.year, result.month) == *year_month {
+                unique_ohpc_1_per_month.push(result.unique_ohpc_1);
+                unique_ohpc_2_per_month.push(result.unique_ohpc_2);
+                unique_ohpc_3_per_month.push(result.unique_ohpc_3);
+                unique_overall_per_month.push(result.unique_overall);
+                json.unique_visitors_per_month.push(UniqueVisitorsPerMonth {
+                    year_month: year_month.clone(),
+                    ohpc1: result.unique_ohpc_1,
+                    ohpc2: result.unique_ohpc_2,
+                    ohpc3: result.unique_ohpc_3,
+                    overall: result.unique_overall,
+                });
+                break;
+            }
+        }
+    }
+
+    let mut plot = Plot::new();
+    plot.add_trace(Scatter::new(year_months.clone(), unique_ohpc_1_per_month).name("OHPC 1.3.x"));
+    plot.add_trace(Scatter::new(year_months.clone(), unique_ohpc_2_per_month).name("OHPC 2.x"));
+    plot.add_trace(Scatter::new(year_months.clone(), unique_ohpc_3_per_month).name("OHPC 3.x"));
+    plot.add_trace(Scatter::new(year_months.clone(), unique_overall_per_month).name("Total"));
+    plot.set_layout(Layout::new().title("Unique OHPC repository requests per month".into()));
+
+    if !params.no_svg {
+        plot.write_image(
+            Path::new(&params.output_directory).join("unique_visitors_per_month.svg"),
+            ImageFormat::SVG,
+            1600,
+            600,
+            1.0,
+        );
+    }
+
+    Ok(plot.to_inline_html(None))
+}
+
+fn create_repository_requests_per_year_and_distribution(
+) -> Result<String, Box<dyn std::error::Error>> {
     let mut ohpc_1_sles: Vec<i64> = Vec::new();
     let mut ohpc_1_rhel: Vec<i64> = Vec::new();
-    let data_ohpc_1 = OHPC1_RESULTS.read().unwrap();
-    years = Vec::new();
+    let data_ohpc_1 = OHPC1_RESULTS.read()?;
+    let mut years = Vec::new();
+    let mut ticks: Vec<f64> = Vec::new();
+
     for result in &*data_ohpc_1 {
         years.push(result.year);
     }
@@ -975,23 +1109,23 @@ fn create_plots(params: Args) -> Result<(), Box<dyn std::error::Error>> {
             if result.year == *year {
                 ohpc_1_sles.push(result.sles);
                 ohpc_1_rhel.push(result.rhel);
+                ticks.push((*year) as f64);
                 break;
             }
         }
     }
-    let trace_ohpc_1_sles = Scatter::new(years.clone(), ohpc_1_sles).name("OHPC SLES 1.3.x");
-    let trace_ohpc_1_rhel = Scatter::new(years.clone(), ohpc_1_rhel).name("OHPC RHEL 1.3.x");
-    let mut plot_ohpc_1 = Plot::new();
-    plot_ohpc_1.add_trace(trace_ohpc_1_sles);
-    plot_ohpc_1.add_trace(trace_ohpc_1_rhel);
-    let layout_ohpc_1 = Layout::new()
-        .title("OHPC repository requests per year and distribution".into())
-        .x_axis(Axis::new().tick_values(ticks.clone()));
-    plot_ohpc_1.set_layout(layout_ohpc_1);
+    let mut plot = Plot::new();
+    plot.add_trace(Scatter::new(years.clone(), ohpc_1_sles).name("OHPC SLES 1.3.x"));
+    plot.add_trace(Scatter::new(years.clone(), ohpc_1_rhel).name("OHPC RHEL 1.3.x"));
+    plot.set_layout(
+        Layout::new()
+            .title("OHPC repository requests per year and distribution".into())
+            .x_axis(Axis::new().tick_values(ticks.clone())),
+    );
 
     let mut ohpc_2_sles: Vec<i64> = Vec::new();
     let mut ohpc_2_rhel: Vec<i64> = Vec::new();
-    let data_ohpc_2 = OHPC2_RESULTS.read().unwrap();
+    let data_ohpc_2 = OHPC2_RESULTS.read()?;
     years = Vec::new();
     for result in &*data_ohpc_2 {
         years.push(result.year);
@@ -1007,10 +1141,8 @@ fn create_plots(params: Args) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    let trace_ohpc_2_sles = Scatter::new(years.clone(), ohpc_2_sles).name("OHPC SLES 2.x");
-    let trace_ohpc_2_rhel = Scatter::new(years.clone(), ohpc_2_rhel).name("OHPC RHEL 2.x");
-    plot_ohpc_1.add_trace(trace_ohpc_2_sles);
-    plot_ohpc_1.add_trace(trace_ohpc_2_rhel);
+    plot.add_trace(Scatter::new(years.clone(), ohpc_2_sles).name("OHPC SLES 2.x"));
+    plot.add_trace(Scatter::new(years.clone(), ohpc_2_rhel).name("OHPC RHEL 2.x"));
 
     let mut ohpc_3_sles: Vec<i64> = Vec::new();
     let mut ohpc_3_rhel: Vec<i64> = Vec::new();
@@ -1031,17 +1163,70 @@ fn create_plots(params: Args) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    let trace_ohpc_3_sles = Scatter::new(years.clone(), ohpc_3_sles).name("OHPC SLES 3.x");
-    let trace_ohpc_3_rhel = Scatter::new(years.clone(), ohpc_3_rhel).name("OHPC RHEL 3.x");
-    let trace_ohpc_3_openeuler =
-        Scatter::new(years.clone(), ohpc_3_openeuler).name("OHPC openEuler 3.x");
-    plot_ohpc_1.add_trace(trace_ohpc_3_sles);
-    plot_ohpc_1.add_trace(trace_ohpc_3_rhel);
-    plot_ohpc_1.add_trace(trace_ohpc_3_openeuler);
+    plot.add_trace(Scatter::new(years.clone(), ohpc_3_sles).name("OHPC SLES 3.x"));
+    plot.add_trace(Scatter::new(years.clone(), ohpc_3_rhel).name("OHPC RHEL 3.x"));
+    plot.add_trace(Scatter::new(years.clone(), ohpc_3_openeuler).name("OHPC openEuler 3.x"));
 
-    let data_libdnf = LIBDNF_RESULTS.read().unwrap();
-    years = Vec::new();
+    Ok(plot.to_inline_html(None))
+}
+
+fn create_data_downloaded_per_month(
+    params: &Args,
+
+    json: &mut Json,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut size_per_month: Vec<u64> = Vec::new();
+    let mut year_months: Vec<String> = Vec::new();
+
+    let data = OVERALL_RESULTS_PER_MONTH.read()?;
+    for result in &*data {
+        year_months.push(format!("{}-{:02}", result.year, result.month));
+    }
+    year_months.sort_unstable();
+
+    for year_month in &year_months {
+        for result in &*data {
+            if format!("{}-{:02}", result.year, result.month) == *year_month {
+                size_per_month.push(result.size);
+                json.size_per_month.push(SizePerMonth {
+                    year_month: year_month.clone(),
+                    size: result.size,
+                });
+                break;
+            }
+        }
+    }
+
+    let mut plot = Plot::new();
+    plot.add_trace(Scatter::new(year_months.clone(), size_per_month).name("Total"));
+    plot.set_layout(Layout::new().title("OHPC data downloaded per month".into()));
+
+    if !params.no_svg {
+        plot.write_image(
+            Path::new(&params.output_directory).join("size_per_month.svg"),
+            ImageFormat::SVG,
+            1600,
+            600,
+            1.0,
+        );
+    }
+
+    Ok(plot.to_inline_html(None))
+}
+
+fn create_libdnf_requests_per_year_and_distribution() -> Result<String, Box<dyn std::error::Error>>
+{
+    let mut ticks: Vec<f64> = Vec::new();
+    let data_libdnf = LIBDNF_RESULTS.read()?;
+    let mut years = Vec::new();
     let mut distributions: Vec<String> = Vec::new();
+    #[derive(Debug)]
+
+    struct LibdnfTraceResults {
+        years: Vec<i64>,
+        count: Vec<i64>,
+    }
+
     for result in &*data_libdnf {
         years.push(result.year);
         distributions.push(result.name.clone());
@@ -1051,10 +1236,13 @@ fn create_plots(params: Args) -> Result<(), Box<dyn std::error::Error>> {
     distributions.sort_unstable();
     distributions.dedup();
 
-    #[derive(Debug)]
-    struct LibdnfTraceResults {
-        years: Vec<i64>,
-        count: Vec<i64>,
+    for year in years.clone() {
+        for result in &*data_libdnf {
+            if result.year == year {
+                ticks.push((year) as f64);
+                break;
+            }
+        }
     }
 
     let mut libdnf_results: HashMap<String, LibdnfTraceResults> = HashMap::new();
@@ -1092,22 +1280,41 @@ fn create_plots(params: Args) -> Result<(), Box<dyn std::error::Error>> {
         plot_libdnf.add_trace(trace_libdnf);
     }
 
-    {
-        output = Path::new(&params.output_directory).join(params.html_output);
-        let mut file = File::create(output).unwrap();
-        file.write_all(HTML_HEADER.as_bytes())?;
-        file.write_all(plot.to_inline_html(None).as_bytes())?;
-        file.write_all(unique_plot.to_inline_html(None).as_bytes())?;
-        file.write_all(plot_overall_per_month.to_inline_html(None).as_bytes())?;
-        file.write_all(plot_unique_per_month.to_inline_html(None).as_bytes())?;
-        file.write_all(plot_size_per_year.to_inline_html(None).as_bytes())?;
-        file.write_all(plot_size_per_month.to_inline_html(None).as_bytes())?;
-        file.write_all(plot_ohpc_1.to_inline_html(None).as_bytes())?;
-        file.write_all(plot_libdnf.to_inline_html(None).as_bytes())?;
-        file.write_all(create_overall_plot().as_bytes())?;
-        file.write_all(create_type_plot().as_bytes())?;
-        file.write_all(HTML_FOOTER.as_bytes())?;
-    }
+    Ok(plot_libdnf.to_inline_html(None))
+}
+
+fn create_plots(params: Args) -> Result<(), Box<dyn std::error::Error>> {
+    let mut years: Vec<i64> = Vec::new();
+    get_years(&mut years)?;
+
+    let mut json = Json {
+        unique_visitors_per_year: Vec::new(),
+        unique_visitors_per_month: Vec::new(),
+        size_per_year: Vec::new(),
+        size_per_month: Vec::new(),
+    };
+
+    let mut file = File::create(Path::new(&params.output_directory).join(&params.html_output))?;
+    file.write_all(HTML_HEADER.as_bytes())?;
+    file.write_all(create_repository_requests_per_year(&years)?.as_bytes())?;
+    file.write_all(
+        create_unique_repository_requests_per_year(&years, &params, &mut json)?.as_bytes(),
+    )?;
+    file.write_all(create_repository_requests_per_month()?.as_bytes())?;
+    file.write_all(create_unique_repository_requests_per_month(&params, &mut json)?.as_bytes())?;
+    file.write_all(create_data_downloaded_per_year(&years, &params, &mut json)?.as_bytes())?;
+    file.write_all(create_data_downloaded_per_month(&params, &mut json)?.as_bytes())?;
+    file.write_all(create_repository_requests_per_year_and_distribution()?.as_bytes())?;
+    file.write_all(create_libdnf_requests_per_year_and_distribution()?.as_bytes())?;
+    file.write_all(create_overall_plot().as_bytes())?;
+    file.write_all(create_type_plot().as_bytes())?;
+    file.write_all(HTML_FOOTER.as_bytes())?;
+
+    let mut writer = std::io::BufWriter::new(File::create(
+        Path::new(&params.output_directory).join("stats.json"),
+    )?);
+    serde_json::to_writer(&mut writer, &json)?;
+    writer.flush()?;
 
     Ok(())
 }

@@ -8,13 +8,13 @@ on:
 
 jobs:
   build:
-    name: Run cargo build and cargo clippy
+    name: Run cargo build, cargo clippy and tests
     runs-on: ubuntu-latest
     container:
       image: docker.io/library/almalinux:9
     steps:
     - name: Install tools
-      run: dnf -y install git cargo clippy openssl-devel
+      run: dnf -y install git cargo clippy openssl-devel jq
     - name: Extend $PATH
       run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
     - uses: actions/checkout@v4
@@ -22,3 +22,5 @@ jobs:
       run: cargo build --verbose
     - name: Run clippy
       run: cargo clippy --verbose
+    - name: Run tests
+      run: tests/run_tests.sh
