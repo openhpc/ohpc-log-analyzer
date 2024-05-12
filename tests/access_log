@@ -171,6 +171,8 @@
 1.2.3.4 - - [27/Apr/2024:15:02:11 +0000] "GET /OpenHPC/2/CentOS_8/repodata/repomd.xml HTTP/1.1" 200 1517 "-" "libdnf"
 1.2.3.4 - - [27/Apr/2024:15:02:11 +0000] "GET /OpenHPC/2/updates/CentOS_8/repodata/repomd.xml HTTP/1.1" 200 3107 "-" "libdnf"
 1.2.3.5 - - [27/Apr/2024:15:02:12 +0000] "GET /OpenHPC/2/EL_8/repodata/repomd.xml HTTP/1.1" 200 1517 "-" "libdnf (Red Hat Enterprise Linux 8.7; generic; Linux.x86_64)"
+1.2.3.5 - - [27/Apr/2024:15:02:12 +0000] "GET /OpenHPC/2/EL_8/repodata/repomd.xml HTTP/1.1" 200 1517 "-" "libdnf (Red Hat Enterprise Linux Server 8.7; generic; Linux.x86_64)"
+1.2.3.5 - - [27/Apr/2024:15:02:12 +0000] "GET /OpenHPC/2/EL_8/repodata/repomd.xml HTTP/1.1" 200 1517 "-" "libdnf (Red Hat Enterprise Linux 8.7; generic; Linux.x86_64)"
 1.2.3.5 - - [27/Apr/2024:15:02:13 +0000] "GET /OpenHPC/2/update.2.6.1/EL_8/repodata/repomd.xml HTTP/1.1" 200 1519 "-" "libdnf (Red Hat Enterprise Linux 8.7; generic; Linux.x86_64)"
 1.2.3. - - [27/Apr/2024:15:02:16 +0000] "GET /OpenHPC/2/EL_8/repodata/repomd.xml HTTP/1.1" 200 1517 "-" "libdnf (Rocky Linux 8.8; generic; Linux.x86_64)"
 1.2.3. - - [27/Apr/2024:15:02:16 +0000] "GET /OpenHPC/2/updates/EL_8/repodata/repomd.xml HTTP/1.1" 200 3107 "-" "libdnf (Rocky Linux 8.8; generic; Linux.x86_64)"
