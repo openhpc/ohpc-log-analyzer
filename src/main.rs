@@ -120,7 +120,7 @@ struct ResultOHPC3 {
     openeuler: i64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 struct ResultLIBDNF {
     year: i64,
     name: String,
@@ -168,6 +168,7 @@ struct Json {
     unique_visitors_per_month: Vec<UniqueVisitorsPerMonth>,
     size_per_year: Vec<SizePerYear>,
     size_per_month: Vec<SizePerMonth>,
+    result_libdnf: Vec<ResultLIBDNF>,
 }
 
 static OVERALL_RESULTS: RwLock<Vec<ResultOverall>> = RwLock::new(Vec::new());
@@ -240,14 +241,28 @@ fn count_libdnf(elements: &[String], year: i64) {
     if elements[11] != "\"libdnf" {
         return;
     }
+
     let user_agent_long = elements[12..].join(" ");
     let user_agent_vec: Vec<_> = user_agent_long.split(';').map(|s| s.to_string()).collect();
     let mut user_agent_short = user_agent_vec[0].clone();
     user_agent_short.truncate(user_agent_short.rfind(' ').unwrap());
-    let user_agent = &user_agent_short[1..];
+    let mut user_agent = &user_agent_short[1..];
     if user_agent.is_empty() {
         return;
     }
+    let change_name = HashMap::from([
+        (
+            "Red Hat Enterprise Linux Server",
+            "Red Hat Enterprise Linux",
+        ),
+        ("CentOS AutoSD", "CentOS Linux"),
+        ("CentOS release 8", "CentOS Linux"),
+        ("RockyLinux", "Rocky Linux"),
+    ]);
+    if change_name.contains_key(&user_agent) {
+        user_agent = change_name[&user_agent];
+    }
+
     let mut data = LIBDNF_RESULTS.write().unwrap();
     let mut name_and_year_found = false;
     for result in data.as_mut_slice() {
@@ -1172,7 +1187,6 @@ fn create_repository_requests_per_year_and_distribution(
 
 fn create_data_downloaded_per_month(
     params: &Args,
-
     json: &mut Json,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut size_per_month: Vec<u64> = Vec::new();
@@ -1214,14 +1228,15 @@ fn create_data_downloaded_per_month(
     Ok(plot.to_inline_html(None))
 }
 
-fn create_libdnf_requests_per_year_and_distribution() -> Result<String, Box<dyn std::error::Error>>
-{
+fn create_libdnf_requests_per_year_and_distribution(
+    json: &mut Json,
+) -> Result<String, Box<dyn std::error::Error>> {
     let mut ticks: Vec<f64> = Vec::new();
     let data_libdnf = LIBDNF_RESULTS.read()?;
     let mut years = Vec::new();
     let mut distributions: Vec<String> = Vec::new();
-    #[derive(Debug)]
 
+    #[derive(Debug)]
     struct LibdnfTraceResults {
         years: Vec<i64>,
         count: Vec<i64>,
@@ -1260,6 +1275,11 @@ fn create_libdnf_requests_per_year_and_distribution() -> Result<String, Box<dyn 
                     };
                     values.years.push(*year);
                     values.count.push(result.count);
+                    json.result_libdnf.push(ResultLIBDNF {
+                        year: *year,
+                        name: result.name.clone(),
+                        count: result.count,
+                    });
                 }
             }
         }
@@ -1292,6 +1312,7 @@ fn create_plots(params: Args) -> Result<(), Box<dyn std::error::Error>> {
         unique_visitors_per_month: Vec::new(),
         size_per_year: Vec::new(),
         size_per_month: Vec::new(),
+        result_libdnf: Vec::new(),
     };
 
     let mut file = File::create(Path::new(&params.output_directory).join(&params.html_output))?;
@@ -1305,7 +1326,7 @@ fn create_plots(params: Args) -> Result<(), Box<dyn std::error::Error>> {
     file.write_all(create_data_downloaded_per_year(&years, &params, &mut json)?.as_bytes())?;
     file.write_all(create_data_downloaded_per_month(&params, &mut json)?.as_bytes())?;
     file.write_all(create_repository_requests_per_year_and_distribution()?.as_bytes())?;
-    file.write_all(create_libdnf_requests_per_year_and_distribution()?.as_bytes())?;
+    file.write_all(create_libdnf_requests_per_year_and_distribution(&mut json)?.as_bytes())?;
     file.write_all(create_overall_plot().as_bytes())?;
     file.write_all(create_type_plot().as_bytes())?;
     file.write_all(HTML_FOOTER.as_bytes())?;
