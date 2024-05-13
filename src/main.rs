@@ -1,3 +1,4 @@
+extern crate indicatif;
 extern crate regex;
 extern crate serde;
 
@@ -27,6 +28,12 @@ use std::{
 };
 
 use clap::Parser;
+use console::style;
+use console::Emoji;
+use indicatif::{
+    ProgressBar,
+    ProgressStyle,
+};
 use plotly::layout::{
     Axis,
     BarMode,
@@ -45,6 +52,9 @@ static OVERALL: AtomicUsize = AtomicUsize::new(0);
 static OHPC_1: AtomicUsize = AtomicUsize::new(0);
 static OHPC_2: AtomicUsize = AtomicUsize::new(0);
 static OHPC_3: AtomicUsize = AtomicUsize::new(0);
+static STEPS: AtomicUsize = AtomicUsize::new(2);
+static CALL_COUNT: AtomicUsize = AtomicUsize::new(1);
+static CHUNK: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -716,16 +726,38 @@ fn process_line(s: &[u8]) {
     }
 }
 
+pub fn print_step(msg: String) {
+    let s = CALL_COUNT.load(Ordering::SeqCst);
+    CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+    println!(
+        " Step {}: {} {}",
+        style(format!("[{}/{}]", s, STEPS.load(Ordering::SeqCst)))
+            .bold()
+            .dim(),
+        Emoji("🔍", ""),
+        msg,
+    );
+}
+
 const CHUNK_SIZE: usize = 100_000_000;
 
 fn main() {
     let params = Args::parse();
     let output = Path::new(&params.output_directory).join(&params.html_output);
-    println!("Using '{}' as output directory", params.output_directory);
-    println!("Using '{}' as html output", output.display());
+    STEPS.fetch_add(params.access_log.len(), Ordering::SeqCst);
+    print_step(format!(
+        "Using '{}' as output directory",
+        params.output_directory
+    ));
+    print_step(format!("Using '{}' as html output", output.display()));
+    let spinner_style = ProgressStyle::with_template("{prefix:.bold.dim} {spinner} {wide_msg}")
+        .unwrap()
+        .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ");
     let pool = rayon::ThreadPoolBuilder::new().build().unwrap();
 
     for input in params.access_log.clone().into_iter() {
+        let pb = ProgressBar::new(0);
+        pb.set_style(spinner_style.clone());
         let mut access_log = match std::fs::File::open(input.clone()) {
             Ok(a) => a,
             Err(e) => {
@@ -733,7 +765,8 @@ fn main() {
                 process::exit(1);
             }
         };
-        println!("Using '{:}' as input", input);
+        print_step(format!("Using '{:}' as input", input));
+
         pool.scope(|scope| {
             let mut s = Vec::with_capacity(CHUNK_SIZE);
             loop {
@@ -747,11 +780,14 @@ fn main() {
                     break;
                 }
 
+                CHUNK.fetch_add(CHUNK_SIZE, Ordering::SeqCst);
                 // Copy any incomplete lines to the next s.
                 let last_newline = last_newline(&s);
                 let mut next_s = Vec::with_capacity(CHUNK_SIZE);
                 next_s.extend_from_slice(&s[last_newline..]);
                 s.truncate(last_newline);
+                pb.set_message(format!("Reading megabytes {}", CHUNK.load(Ordering::SeqCst)/1024/1024));
+                pb.inc(1);
 
                 loop {
                     // Do not spawn any more threads if the queue is already full.
@@ -784,6 +820,7 @@ fn main() {
                 });
                 s = next_s;
             }
+            pb.finish();
         });
     }
     if let Err(e) = create_plots(params) {
