@@ -1,6 +1,6 @@
 [package]
 name = "ohpc-log-analyzer"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 
 [dependencies]
@@ -8,6 +8,7 @@ clap = { version = "4.3.24", features = ["derive"] }
 console = "0.15.8"
 getopts = "0.2.21"
 indicatif = "0.17.8"
+maxminddb = "0.24.0"
 plotly =  { version = "0.8.4", features = ["kaleido"] }
 rayon = "1.10.0"
 regex = "1.10.4"
