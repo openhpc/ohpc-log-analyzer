@@ -34,6 +34,21 @@ if [ "${OVERALL_2024}" != "25" ]; then
 	exit 1
 fi
 
+RHEL_2024=$(jq '.result_libdnf[3].count' "${DEST}"/stats.json)
+if [ "${RHEL_2024}" != "14" ]; then
+	echo "ERROR: json returned unexpected value"
+	jq '.' "${DEST}"/stats.json
+	exit 1
+fi
+
+JP_2023=$(jq '.result_country[4].count' "${DEST}"/stats.json)
+if [ "${JP_2023}" != "2" ]; then
+	echo "ERROR: json returned unexpected value"
+	jq '.' "${DEST}"/stats.json
+	exit 1
+fi
+
 jq '.' "${DEST}"/stats.json
 
 rm -rf "${DEST}"
+echo "PASS"

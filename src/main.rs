@@ -21,18 +21,27 @@ use std::sync::atomic::{
     AtomicUsize,
     Ordering,
 };
-use std::sync::RwLock;
+use std::sync::{
+    Arc,
+    RwLock,
+};
 use std::{
     process,
     str,
 };
 
 use clap::Parser;
-use console::style;
-use console::Emoji;
+use console::{
+    style,
+    Emoji,
+};
 use indicatif::{
     ProgressBar,
     ProgressStyle,
+};
+use maxminddb::{
+    geoip2,
+    Reader,
 };
 use plotly::layout::{
     Axis,
@@ -70,6 +79,10 @@ struct Args {
     /// Do not write svg output files
     #[arg(long, default_value = "false")]
     no_svg: bool,
+
+    /// GeoIP mmdb database
+    #[arg(long, default_value = "/usr/share/GeoIP/GeoLite2-Country.mmdb")]
+    geoip: String,
 
     /// One or multiple access logs
     access_log: Vec<String>,
@@ -137,6 +150,14 @@ struct ResultLIBDNF {
     count: i64,
 }
 
+#[derive(Debug, Serialize)]
+struct ResultCountry {
+    year: i64,
+    month: i64,
+    country: String,
+    count: i64,
+}
+
 #[derive(Debug)]
 struct ResultType {
     year: i64,
@@ -179,6 +200,7 @@ struct Json {
     size_per_year: Vec<SizePerYear>,
     size_per_month: Vec<SizePerMonth>,
     result_libdnf: Vec<ResultLIBDNF>,
+    result_country: Vec<ResultCountry>,
 }
 
 static OVERALL_RESULTS: RwLock<Vec<ResultOverall>> = RwLock::new(Vec::new());
@@ -187,6 +209,7 @@ static OHPC1_RESULTS: RwLock<Vec<ResultOHPC1>> = RwLock::new(Vec::new());
 static OHPC2_RESULTS: RwLock<Vec<ResultOHPC2>> = RwLock::new(Vec::new());
 static OHPC3_RESULTS: RwLock<Vec<ResultOHPC3>> = RwLock::new(Vec::new());
 static LIBDNF_RESULTS: RwLock<Vec<ResultLIBDNF>> = RwLock::new(Vec::new());
+static COUNTRY_RESULTS: RwLock<Vec<ResultCountry>> = RwLock::new(Vec::new());
 static TYPE_RESULTS: RwLock<Vec<ResultType>> = RwLock::new(Vec::new());
 
 static HTML_HEADER: &str =
@@ -244,6 +267,33 @@ fn count_type(elements: &[String], year: i64) {
     }
 }
 
+fn count_countries(year: i64, month: i64, geoip_reader: &Arc<Reader<Vec<u8>>>, ip: &IpAddr) {
+    let client_country = match geoip_reader.lookup::<geoip2::Country>(*ip) {
+        Ok(c) => match c.country {
+            Some(co) => match co.iso_code {
+                Some(iso) => iso.to_string(),
+                _ => "N/A".to_string(),
+            },
+            _ => "N/A".to_string(),
+        },
+        _ => "N/A".to_string(),
+    };
+
+    let mut data = COUNTRY_RESULTS.write().unwrap();
+    for result in data.as_mut_slice() {
+        if result.year == year && result.country == client_country && result.month == month {
+            result.count += 1;
+            return;
+        }
+    }
+    data.push(ResultCountry {
+        year,
+        month,
+        country: client_country,
+        count: 1,
+    });
+}
+
 fn count_libdnf(elements: &[String], year: i64) {
     if elements.len() < 12 {
         return;
@@ -274,21 +324,17 @@ fn count_libdnf(elements: &[String], year: i64) {
     }
 
     let mut data = LIBDNF_RESULTS.write().unwrap();
-    let mut name_and_year_found = false;
     for result in data.as_mut_slice() {
         if result.year == year && result.name == user_agent {
-            name_and_year_found = true;
             result.count += 1;
-            break;
+            return;
         }
     }
-    if !name_and_year_found {
-        data.push(ResultLIBDNF {
-            year,
-            name: user_agent.to_string(),
-            count: 1,
-        });
-    }
+    data.push(ResultLIBDNF {
+        year,
+        name: user_agent.to_string(),
+        count: 1,
+    });
 }
 
 fn update_distributions_ohpc_3(s: &[u8], year: i64) {
@@ -369,7 +415,7 @@ fn month_to_int(s: &str) -> i64 {
     }
 }
 
-fn process_line(s: &[u8]) {
+fn process_line(s: &[u8], geoip_reader: &Arc<Reader<Vec<u8>>>) {
     let line = str::from_utf8(s).unwrap();
     let elements: Vec<_> = line.split(' ').map(|s| s.to_string()).collect();
     OVERALL.fetch_add(1, Ordering::SeqCst);
@@ -533,6 +579,8 @@ fn process_line(s: &[u8]) {
         Ok(ip) => ip,
         _ => IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
     };
+
+    count_countries(year, month, geoip_reader, &ip);
 
     {
         let mut data = OVERALL_RESULTS.write().unwrap();
@@ -755,6 +803,14 @@ fn main() {
         .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ");
     let pool = rayon::ThreadPoolBuilder::new().build().unwrap();
 
+    let geoip_reader = match maxminddb::Reader::open_readfile(&params.geoip) {
+        Ok(geoip_reader) => Arc::new(geoip_reader),
+        _ => {
+            println!("Reading GeoIP2 database {} failed", params.geoip);
+            process::exit(1);
+        }
+    };
+
     for input in params.access_log.clone().into_iter() {
         let pb = ProgressBar::new(0);
         pb.set_style(spinner_style.clone());
@@ -786,7 +842,10 @@ fn main() {
                 let mut next_s = Vec::with_capacity(CHUNK_SIZE);
                 next_s.extend_from_slice(&s[last_newline..]);
                 s.truncate(last_newline);
-                pb.set_message(format!("Reading megabytes {}", CHUNK.load(Ordering::SeqCst)/1024/1024));
+                pb.set_message(format!(
+                    "Reading megabytes {}",
+                    CHUNK.load(Ordering::SeqCst) / 1024 / 1024
+                ));
                 pb.inc(1);
 
                 loop {
@@ -798,6 +857,7 @@ fn main() {
 
                 // Move our string into a rayon thread.
                 let data = s;
+                let geoip_reader = Arc::clone(&geoip_reader);
                 scope.spawn(move |_| {
                     let re = Regex::new(r"(.*GET.*){2,}").unwrap();
                     let d_s = data[..last_newline].split(|c| *c == b'\n');
@@ -815,7 +875,7 @@ fn main() {
                             // Skip broken lines with two or more "GET"s
                             continue;
                         }
-                        process_line(i);
+                        process_line(i, &geoip_reader);
                     }
                 });
                 s = next_s;
@@ -1265,6 +1325,72 @@ fn create_data_downloaded_per_month(
     Ok(plot.to_inline_html(None))
 }
 
+fn create_country_per_year_and_month(
+    json: &mut Json,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut year_months: Vec<String> = Vec::new();
+    let mut countries: Vec<String> = Vec::new();
+
+    let data = COUNTRY_RESULTS.read()?;
+    for result in &*data {
+        year_months.push(format!("{}-{:02}", result.year, result.month));
+        countries.push(result.country.clone());
+    }
+    year_months.sort_unstable();
+    year_months.dedup();
+    countries.sort_unstable();
+    countries.dedup();
+
+    #[derive(Debug)]
+    struct CountryTraceResults {
+        year_months: Vec<String>,
+        count: Vec<i64>,
+    }
+
+    let mut country_results: HashMap<String, CountryTraceResults> = HashMap::new();
+
+    for country in &countries {
+        for year_month in &year_months {
+            for result in &*data {
+                if format!("{}-{:02}", result.year, result.month) == (*year_month).clone()
+                    && result.country == *country
+                {
+                    let values = match country_results.entry((*country.clone()).to_string()) {
+                        Entry::Occupied(o) => o.into_mut(),
+                        Entry::Vacant(v) => v.insert(CountryTraceResults {
+                            year_months: Vec::new(),
+                            count: Vec::new(),
+                        }),
+                    };
+                    values.year_months.push((*year_month).clone());
+                    values.count.push(result.count);
+                    json.result_country.push(ResultCountry {
+                        year: result.year,
+                        month: result.month,
+                        country: (*country.clone()).to_string(),
+                        count: result.count,
+                    });
+                }
+            }
+        }
+    }
+
+    let mut plot = Plot::new();
+    let layout_country = Layout::new().title("OHPC repository country requests per month".into());
+    plot.set_layout(layout_country);
+
+    for result in country_results.keys() {
+        let trace_countries = Scatter::new(
+            country_results[result].year_months.clone(),
+            country_results[result].count.clone(),
+        )
+        .name(result);
+        plot.add_trace(trace_countries);
+    }
+
+    Ok(plot.to_inline_html(None))
+}
+
 fn create_libdnf_requests_per_year_and_distribution(
     json: &mut Json,
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -1350,6 +1476,7 @@ fn create_plots(params: Args) -> Result<(), Box<dyn std::error::Error>> {
         size_per_year: Vec::new(),
         size_per_month: Vec::new(),
         result_libdnf: Vec::new(),
+        result_country: Vec::new(),
     };
 
     let mut file = File::create(Path::new(&params.output_directory).join(&params.html_output))?;
@@ -1366,6 +1493,7 @@ fn create_plots(params: Args) -> Result<(), Box<dyn std::error::Error>> {
     file.write_all(create_libdnf_requests_per_year_and_distribution(&mut json)?.as_bytes())?;
     file.write_all(create_overall_plot().as_bytes())?;
     file.write_all(create_type_plot().as_bytes())?;
+    file.write_all(create_country_per_year_and_month(&mut json)?.as_bytes())?;
     file.write_all(HTML_FOOTER.as_bytes())?;
 
     let mut writer = std::io::BufWriter::new(File::create(
