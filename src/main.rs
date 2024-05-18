@@ -15,6 +15,7 @@ use std::io::{
 use std::net::{
     IpAddr,
     Ipv4Addr,
+    Ipv6Addr,
 };
 use std::path::Path;
 use std::sync::atomic::{
@@ -39,10 +40,6 @@ use indicatif::{
     ProgressBar,
     ProgressStyle,
 };
-use maxminddb::{
-    geoip2,
-    Reader,
-};
 use plotly::layout::{
     Axis,
     BarMode,
@@ -54,6 +51,7 @@ use plotly::{
     Plot,
     Scatter,
 };
+use rayon::prelude::*;
 use regex::bytes::Regex;
 use serde::Serialize;
 
@@ -117,8 +115,8 @@ struct ResultOverallPerMonth {
     unique_ohpc_3: i64,
     unique_overall: i64,
     size: u64,
-    ipv4: HashSet<u32>,
-    ipv6: HashSet<u128>,
+    ipv4: HashMap<u32, i64>,
+    ipv6: HashMap<u128, i64>,
 }
 
 #[derive(Debug)]
@@ -267,33 +265,6 @@ fn count_type(elements: &[String], year: i64) {
     }
 }
 
-fn count_countries(year: i64, month: i64, geoip_reader: &Arc<Reader<Vec<u8>>>, ip: &IpAddr) {
-    let client_country = match geoip_reader.lookup::<geoip2::Country>(*ip) {
-        Ok(c) => match c.country {
-            Some(co) => match co.iso_code {
-                Some(iso) => iso.to_string(),
-                _ => "N/A".to_string(),
-            },
-            _ => "N/A".to_string(),
-        },
-        _ => "N/A".to_string(),
-    };
-
-    let mut data = COUNTRY_RESULTS.write().unwrap();
-    for result in data.as_mut_slice() {
-        if result.year == year && result.country == client_country && result.month == month {
-            result.count += 1;
-            return;
-        }
-    }
-    data.push(ResultCountry {
-        year,
-        month,
-        country: client_country,
-        count: 1,
-    });
-}
-
 fn count_libdnf(elements: &[String], year: i64) {
     if elements.len() < 12 {
         return;
@@ -415,7 +386,7 @@ fn month_to_int(s: &str) -> i64 {
     }
 }
 
-fn process_line(s: &[u8], geoip_reader: &Arc<Reader<Vec<u8>>>) {
+fn process_line(s: &[u8]) {
     let line = str::from_utf8(s).unwrap();
     let elements: Vec<_> = line.split(' ').map(|s| s.to_string()).collect();
     OVERALL.fetch_add(1, Ordering::SeqCst);
@@ -580,8 +551,6 @@ fn process_line(s: &[u8], geoip_reader: &Arc<Reader<Vec<u8>>>) {
         _ => IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
     };
 
-    count_countries(year, month, geoip_reader, &ip);
-
     {
         let mut data = OVERALL_RESULTS.write().unwrap();
         let mut year_found = false;
@@ -718,12 +687,12 @@ fn process_line(s: &[u8], geoip_reader: &Arc<Reader<Vec<u8>>>) {
                 unique_overall: 1,
                 size,
                 ipv4: match &ip {
-                    IpAddr::V4(ipv4) => vec![(*ipv4).into()].into_iter().collect(),
-                    _ => vec![0].into_iter().collect(),
+                    IpAddr::V4(ipv4) => HashMap::from([((*ipv4).into(), 1)]),
+                    _ => HashMap::from([(0, 0)]),
                 },
                 ipv6: match ip {
-                    IpAddr::V6(ipv6) => vec![ipv6.into()].into_iter().collect(),
-                    _ => vec![0].into_iter().collect(),
+                    IpAddr::V6(ipv6) => HashMap::from([(ipv6.into(), 1)]),
+                    _ => HashMap::from([(0, 0)]),
                 },
             })
         } else {
@@ -743,15 +712,23 @@ fn process_line(s: &[u8], geoip_reader: &Arc<Reader<Vec<u8>>>) {
                     let mut unique = false;
                     match ip {
                         IpAddr::V4(ipv4) => {
-                            if !result.ipv4.contains(&ipv4.into()) {
-                                result.ipv4.insert(ipv4.into());
+                            if let std::collections::hash_map::Entry::Vacant(e) =
+                                result.ipv4.entry(ipv4.into())
+                            {
+                                e.insert(1);
                                 unique = true;
+                            } else {
+                                *result.ipv4.get_mut(&ipv4.into()).unwrap() += 1;
                             }
                         }
                         IpAddr::V6(ipv6) => {
-                            if !result.ipv6.contains(&ipv6.into()) {
-                                result.ipv6.insert(ipv6.into());
+                            if let std::collections::hash_map::Entry::Vacant(e) =
+                                result.ipv6.entry(ipv6.into())
+                            {
+                                e.insert(1);
                                 unique = true;
+                            } else {
+                                *result.ipv6.get_mut(&ipv6.into()).unwrap() += 1;
                             }
                         }
                     }
@@ -803,14 +780,6 @@ fn main() {
         .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ");
     let pool = rayon::ThreadPoolBuilder::new().build().unwrap();
 
-    let geoip_reader = match maxminddb::Reader::open_readfile(&params.geoip) {
-        Ok(geoip_reader) => Arc::new(geoip_reader),
-        _ => {
-            println!("Reading GeoIP2 database {} failed", params.geoip);
-            process::exit(1);
-        }
-    };
-
     for input in params.access_log.clone().into_iter() {
         let pb = ProgressBar::new(0);
         pb.set_style(spinner_style.clone());
@@ -857,7 +826,6 @@ fn main() {
 
                 // Move our string into a rayon thread.
                 let data = s;
-                let geoip_reader = Arc::clone(&geoip_reader);
                 scope.spawn(move |_| {
                     let re = Regex::new(r"(.*GET.*){2,}").unwrap();
                     let d_s = data[..last_newline].split(|c| *c == b'\n');
@@ -875,7 +843,7 @@ fn main() {
                             // Skip broken lines with two or more "GET"s
                             continue;
                         }
-                        process_line(i, &geoip_reader);
+                        process_line(i);
                     }
                 });
                 s = next_s;
@@ -1325,9 +1293,101 @@ fn create_data_downloaded_per_month(
     Ok(plot.to_inline_html(None))
 }
 
+fn fill_country_results(params: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let geoip_reader = match maxminddb::Reader::open_readfile(&params.geoip) {
+        Ok(geoip_reader) => Arc::new(geoip_reader),
+        _ => {
+            println!("Reading GeoIP2 database {} failed", params.geoip);
+            process::exit(1);
+        }
+    };
+
+    let data = OVERALL_RESULTS_PER_MONTH.read()?;
+
+    for result in &*data {
+        result.ipv4.par_iter().for_each(|(key, value)| {
+            let client_country = match geoip_reader
+                .lookup::<maxminddb::geoip2::Country>(std::net::IpAddr::V4(Ipv4Addr::from(*key)))
+            {
+                Ok(c) => match c.country {
+                    Some(co) => match co.iso_code {
+                        Some(iso) => iso.to_string(),
+                        _ => "N/A".to_string(),
+                    },
+                    _ => "N/A".to_string(),
+                },
+                _ => "N/A".to_string(),
+            };
+
+            let mut country_results = COUNTRY_RESULTS.write().unwrap();
+
+            let mut found = false;
+            for country_result in country_results.as_mut_slice() {
+                if country_result.year == result.year
+                    && country_result.country == client_country
+                    && country_result.month == result.month
+                {
+                    country_result.count += *value;
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                country_results.push(ResultCountry {
+                    year: result.year,
+                    month: result.month,
+                    country: client_country,
+                    count: *value,
+                });
+            }
+        });
+        result.ipv6.par_iter().for_each(|(key, value)| {
+            let client_country = match geoip_reader
+                .lookup::<maxminddb::geoip2::Country>(std::net::IpAddr::V6(Ipv6Addr::from(*key)))
+            {
+                Ok(c) => match c.country {
+                    Some(co) => match co.iso_code {
+                        Some(iso) => iso.to_string(),
+                        _ => "N/A".to_string(),
+                    },
+                    _ => "N/A".to_string(),
+                },
+                _ => "N/A".to_string(),
+            };
+
+            let mut country_results = COUNTRY_RESULTS.write().unwrap();
+
+            let mut found = false;
+            for country_result in country_results.as_mut_slice() {
+                if country_result.year == result.year
+                    && country_result.country == client_country
+                    && country_result.month == result.month
+                {
+                    country_result.count += *value;
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                country_results.push(ResultCountry {
+                    year: result.year,
+                    month: result.month,
+                    country: client_country,
+                    count: *value,
+                });
+            }
+        });
+    }
+
+    Ok(())
+}
+
 fn create_country_per_year_and_month(
+    params: &Args,
     json: &mut Json,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    fill_country_results(params)?;
+
     let mut year_months: Vec<String> = Vec::new();
     let mut countries: Vec<String> = Vec::new();
 
@@ -1493,7 +1553,7 @@ fn create_plots(params: Args) -> Result<(), Box<dyn std::error::Error>> {
     file.write_all(create_libdnf_requests_per_year_and_distribution(&mut json)?.as_bytes())?;
     file.write_all(create_overall_plot().as_bytes())?;
     file.write_all(create_type_plot().as_bytes())?;
-    file.write_all(create_country_per_year_and_month(&mut json)?.as_bytes())?;
+    file.write_all(create_country_per_year_and_month(&params, &mut json)?.as_bytes())?;
     file.write_all(HTML_FOOTER.as_bytes())?;
 
     let mut writer = std::io::BufWriter::new(File::create(
