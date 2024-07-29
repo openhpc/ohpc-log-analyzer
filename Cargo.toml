@@ -1,9 +1,10 @@
 [package]
 name = "ohpc-log-analyzer"
-version = "1.0.4"
+version = "1.0.5"
 edition = "2021"
 
 [dependencies]
+chrono = "0.4.38"
 clap = { version = "4.3.24", features = ["derive"] }
 console = "0.15.8"
 getopts = "0.2.21"
