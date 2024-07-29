@@ -1,3 +1,4 @@
+extern crate chrono;
 extern crate indicatif;
 extern crate regex;
 extern crate serde;
@@ -26,6 +27,7 @@ use std::sync::{
     Arc,
     RwLock,
 };
+use std::time::Instant;
 use std::{
     process,
     str,
@@ -59,7 +61,7 @@ static OVERALL: AtomicUsize = AtomicUsize::new(0);
 static OHPC_1: AtomicUsize = AtomicUsize::new(0);
 static OHPC_2: AtomicUsize = AtomicUsize::new(0);
 static OHPC_3: AtomicUsize = AtomicUsize::new(0);
-static STEPS: AtomicUsize = AtomicUsize::new(2);
+static STEPS: AtomicUsize = AtomicUsize::new(3);
 static CALL_COUNT: AtomicUsize = AtomicUsize::new(1);
 static CHUNK: AtomicUsize = AtomicUsize::new(0);
 
@@ -214,7 +216,7 @@ static HTML_HEADER: &str =
     "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\" /></head><body>   <div>
 <script src=\"https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-svg.js\"></script>
 <script src=\"https://cdn.plot.ly/plotly-2.12.1.min.js\"></script>";
-static HTML_FOOTER: &str = "</div></body></html>";
+static HTML_FOOTER: &str = "</body></html>";
 
 fn last_newline(s: &[u8]) -> usize {
     let mut i = s.len() - 1;
@@ -767,6 +769,7 @@ pub fn print_step(msg: String) {
 const CHUNK_SIZE: usize = 100_000_000;
 
 fn main() {
+    let start = Instant::now();
     let params = Args::parse();
     let output = Path::new(&params.output_directory).join(&params.html_output);
     STEPS.fetch_add(params.access_log.len(), Ordering::SeqCst);
@@ -851,7 +854,7 @@ fn main() {
             pb.finish();
         });
     }
-    if let Err(e) = create_plots(params) {
+    if let Err(e) = create_plots(params, start) {
         println!("Error creating diagrams: {}", e);
         process::exit(1);
     }
@@ -1526,7 +1529,7 @@ fn create_libdnf_requests_per_year_and_distribution(
     Ok(plot_libdnf.to_inline_html(None))
 }
 
-fn create_plots(params: Args) -> Result<(), Box<dyn std::error::Error>> {
+fn create_plots(params: Args, start: Instant) -> Result<(), Box<dyn std::error::Error>> {
     let mut years: Vec<i64> = Vec::new();
     get_years(&mut years)?;
 
@@ -1554,6 +1557,16 @@ fn create_plots(params: Args) -> Result<(), Box<dyn std::error::Error>> {
     file.write_all(create_overall_plot().as_bytes())?;
     file.write_all(create_type_plot().as_bytes())?;
     file.write_all(create_country_per_year_and_month(&params, &mut json)?.as_bytes())?;
+    file.write_all("</div>".as_bytes())?;
+    let duration = start.elapsed();
+    let timestamp = chrono::Utc::now().to_rfc2822();
+    file.write_all(
+        format!(
+            "<center>Generated on {}. Runtime: {:?}</center>",
+            timestamp, duration
+        )
+        .as_bytes(),
+    )?;
     file.write_all(HTML_FOOTER.as_bytes())?;
 
     let mut writer = std::io::BufWriter::new(File::create(
@@ -1561,6 +1574,8 @@ fn create_plots(params: Args) -> Result<(), Box<dyn std::error::Error>> {
     )?);
     serde_json::to_writer(&mut writer, &json)?;
     writer.flush()?;
+
+    print_step(format!("Finished after {:?} at {}", duration, timestamp,));
 
     Ok(())
 }
