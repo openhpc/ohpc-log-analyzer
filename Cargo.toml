@@ -12,6 +12,6 @@ indicatif = "0.17.8"
 maxminddb = "0.24.0"
 plotly =  { version = "0.8.4", features = ["kaleido"] }
 rayon = "1.10.0"
-regex = "1.10.5"
+regex = "1.10.6"
 serde = "1.0.207"
 serde_json = "1.0.121"
