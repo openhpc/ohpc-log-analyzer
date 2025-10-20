@@ -3,11 +3,9 @@ extern crate indicatif;
 extern crate regex;
 extern crate serde;
 
+use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
-use std::collections::{
-    HashMap,
-    HashSet,
-};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{
     Read,
@@ -122,8 +120,8 @@ struct ResultOverallPerMonth {
     unique_ohpc_4: i64,
     unique_overall: i64,
     size: u64,
-    ipv4: HashMap<u32, i64>,
-    ipv6: HashMap<u128, i64>,
+    ipv4: FxHashMap<u32, i64>,
+    ipv6: FxHashMap<u128, i64>,
 }
 
 #[derive(Debug)]
@@ -298,7 +296,7 @@ fn count_libdnf(elements: &[String], year: i64) {
     if user_agent.is_empty() {
         return;
     }
-    let change_name = HashMap::from([
+    let change_name = FxHashMap::from_iter([
         (
             "Red Hat Enterprise Linux Server",
             "Red Hat Enterprise Linux",
@@ -631,39 +629,15 @@ fn process_line(s: &[u8]) {
         if !year_found {
             data.push(ResultOverall {
                 year,
-                ohpc_1: match ohpc_1 {
-                    true => 1,
-                    false => 0,
-                },
-                ohpc_2: match ohpc_2 {
-                    true => 1,
-                    false => 0,
-                },
-                ohpc_3: match ohpc_3 {
-                    true => 1,
-                    false => 0,
-                },
-                ohpc_4: match ohpc_4 {
-                    true => 1,
-                    false => 0,
-                },
+                ohpc_1: ohpc_1 as i64,
+                ohpc_2: ohpc_2 as i64,
+                ohpc_3: ohpc_3 as i64,
+                ohpc_4: ohpc_4 as i64,
                 overall: 1,
-                unique_ohpc_1: match ohpc_1 {
-                    true => 1,
-                    false => 0,
-                },
-                unique_ohpc_2: match ohpc_2 {
-                    true => 1,
-                    false => 0,
-                },
-                unique_ohpc_3: match ohpc_3 {
-                    true => 1,
-                    false => 0,
-                },
-                unique_ohpc_4: match ohpc_4 {
-                    true => 1,
-                    false => 0,
-                },
+                unique_ohpc_1: ohpc_1 as i64,
+                unique_ohpc_2: ohpc_2 as i64,
+                unique_ohpc_3: ohpc_3 as i64,
+                unique_ohpc_4: ohpc_4 as i64,
                 unique_overall: 1,
                 size,
                 ipv4: match &ip {
@@ -741,48 +715,24 @@ fn process_line(s: &[u8]) {
             data_year_month.push(ResultOverallPerMonth {
                 year,
                 month,
-                ohpc_1: match ohpc_1 {
-                    true => 1,
-                    false => 0,
-                },
-                ohpc_2: match ohpc_2 {
-                    true => 1,
-                    false => 0,
-                },
-                ohpc_3: match ohpc_3 {
-                    true => 1,
-                    false => 0,
-                },
-                ohpc_4: match ohpc_4 {
-                    true => 1,
-                    false => 0,
-                },
+                ohpc_1: ohpc_1 as i64,
+                ohpc_2: ohpc_2 as i64,
+                ohpc_3: ohpc_3 as i64,
+                ohpc_4: ohpc_4 as i64,
                 overall: 1,
-                unique_ohpc_1: match ohpc_1 {
-                    true => 1,
-                    false => 0,
-                },
-                unique_ohpc_2: match ohpc_2 {
-                    true => 1,
-                    false => 0,
-                },
-                unique_ohpc_3: match ohpc_3 {
-                    true => 1,
-                    false => 0,
-                },
-                unique_ohpc_4: match ohpc_4 {
-                    true => 1,
-                    false => 0,
-                },
+                unique_ohpc_1: ohpc_1 as i64,
+                unique_ohpc_2: ohpc_2 as i64,
+                unique_ohpc_3: ohpc_3 as i64,
+                unique_ohpc_4: ohpc_4 as i64,
                 unique_overall: 1,
                 size,
                 ipv4: match &ip {
-                    IpAddr::V4(ipv4) => HashMap::from([((*ipv4).into(), 1)]),
-                    _ => HashMap::from([(0, 0)]),
+                    IpAddr::V4(ipv4) => FxHashMap::from_iter([((*ipv4).into(), 1)]),
+                    _ => FxHashMap::from_iter([(0, 0)]),
                 },
                 ipv6: match ip {
-                    IpAddr::V6(ipv6) => HashMap::from([(ipv6.into(), 1)]),
-                    _ => HashMap::from([(0, 0)]),
+                    IpAddr::V6(ipv6) => FxHashMap::from_iter([(ipv6.into(), 1)]),
+                    _ => FxHashMap::from_iter([(0, 0)]),
                 },
             })
         } else {
@@ -929,12 +879,8 @@ fn main() {
                     let d_s = data[..last_newline].split(|c| *c == b'\n');
 
                     for i in d_s {
-                        let mut search = i.windows(3).position(|window| window == b"png");
-                        if search.is_some() {
-                            continue;
-                        }
-                        search = i.windows(3).position(|window| window == b"gif");
-                        if search.is_some() {
+                        // Skip binary files (images) in a single pass
+                        if i.windows(3).any(|window| window == b"png" || window == b"gif") {
                             continue;
                         }
                         if re.is_match(i) {
@@ -1545,7 +1491,7 @@ fn create_country_per_year_and_month(
         count: Vec<i64>,
     }
 
-    let mut country_results: HashMap<String, CountryTraceResults> = HashMap::new();
+    let mut country_results: FxHashMap<String, CountryTraceResults> = FxHashMap::default();
 
     for country in &countries {
         for year_month in &year_months {
@@ -1621,7 +1567,7 @@ fn create_libdnf_requests_per_year_and_distribution(
         }
     }
 
-    let mut libdnf_results: HashMap<String, LibdnfTraceResults> = HashMap::new();
+    let mut libdnf_results: FxHashMap<String, LibdnfTraceResults> = FxHashMap::default();
 
     for distribution in &distributions {
         for year in &years {
