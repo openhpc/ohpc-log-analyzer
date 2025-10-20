@@ -1447,7 +1447,7 @@ fn fill_country_results(params: &Args) -> Result<(), Box<dyn std::error::Error>>
             let client_country = match geoip_reader
                 .lookup::<maxminddb::geoip2::Country>(std::net::IpAddr::V4(Ipv4Addr::from(*key)))
             {
-                Ok(c) => match c.country {
+                Ok(Some(c)) => match c.country {
                     Some(co) => match co.iso_code {
                         Some(iso) => iso.to_string(),
                         _ => "N/A".to_string(),
@@ -1483,7 +1483,7 @@ fn fill_country_results(params: &Args) -> Result<(), Box<dyn std::error::Error>>
             let client_country = match geoip_reader
                 .lookup::<maxminddb::geoip2::Country>(std::net::IpAddr::V6(Ipv6Addr::from(*key)))
             {
-                Ok(c) => match c.country {
+                Ok(Some(c)) => match c.country {
                     Some(co) => match co.iso_code {
                         Some(iso) => iso.to_string(),
                         _ => "N/A".to_string(),
