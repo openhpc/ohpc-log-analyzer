@@ -61,6 +61,7 @@ static OVERALL: AtomicUsize = AtomicUsize::new(0);
 static OHPC_1: AtomicUsize = AtomicUsize::new(0);
 static OHPC_2: AtomicUsize = AtomicUsize::new(0);
 static OHPC_3: AtomicUsize = AtomicUsize::new(0);
+static OHPC_4: AtomicUsize = AtomicUsize::new(0);
 static STEPS: AtomicUsize = AtomicUsize::new(3);
 static CALL_COUNT: AtomicUsize = AtomicUsize::new(1);
 static CHUNK: AtomicUsize = AtomicUsize::new(0);
@@ -94,10 +95,12 @@ struct ResultOverall {
     ohpc_1: i64,
     ohpc_2: i64,
     ohpc_3: i64,
+    ohpc_4: i64,
     overall: i64,
     unique_ohpc_1: i64,
     unique_ohpc_2: i64,
     unique_ohpc_3: i64,
+    unique_ohpc_4: i64,
     unique_overall: i64,
     size: u64,
     ipv4: HashSet<u32>,
@@ -111,10 +114,12 @@ struct ResultOverallPerMonth {
     ohpc_1: i64,
     ohpc_2: i64,
     ohpc_3: i64,
+    ohpc_4: i64,
     overall: i64,
     unique_ohpc_1: i64,
     unique_ohpc_2: i64,
     unique_ohpc_3: i64,
+    unique_ohpc_4: i64,
     unique_overall: i64,
     size: u64,
     ipv4: HashMap<u32, i64>,
@@ -139,6 +144,13 @@ struct ResultOHPC2 {
 struct ResultOHPC3 {
     year: i64,
     sles: i64,
+    rhel: i64,
+    openeuler: i64,
+}
+
+#[derive(Debug)]
+struct ResultOHPC4 {
+    year: i64,
     rhel: i64,
     openeuler: i64,
 }
@@ -172,6 +184,7 @@ struct UniqueVisitorsPerYear {
     ohpc1: i64,
     ohpc2: i64,
     ohpc3: i64,
+    ohpc4: i64,
     overall: i64,
 }
 #[derive(Serialize)]
@@ -180,6 +193,7 @@ struct UniqueVisitorsPerMonth {
     ohpc1: i64,
     ohpc2: i64,
     ohpc3: i64,
+    ohpc4: i64,
     overall: i64,
 }
 #[derive(Serialize)]
@@ -208,6 +222,7 @@ static OVERALL_RESULTS_PER_MONTH: RwLock<Vec<ResultOverallPerMonth>> = RwLock::n
 static OHPC1_RESULTS: RwLock<Vec<ResultOHPC1>> = RwLock::new(Vec::new());
 static OHPC2_RESULTS: RwLock<Vec<ResultOHPC2>> = RwLock::new(Vec::new());
 static OHPC3_RESULTS: RwLock<Vec<ResultOHPC3>> = RwLock::new(Vec::new());
+static OHPC4_RESULTS: RwLock<Vec<ResultOHPC4>> = RwLock::new(Vec::new());
 static LIBDNF_RESULTS: RwLock<Vec<ResultLIBDNF>> = RwLock::new(Vec::new());
 static COUNTRY_RESULTS: RwLock<Vec<ResultCountry>> = RwLock::new(Vec::new());
 static TYPE_RESULTS: RwLock<Vec<ResultType>> = RwLock::new(Vec::new());
@@ -370,6 +385,53 @@ fn update_distributions_ohpc_3(s: &[u8], year: i64) {
     }
 }
 
+fn update_distributions_ohpc_4(s: &[u8], year: i64) {
+    let el_10 = "EL_10".as_bytes();
+    let openeuler = "openEuler_24.03".as_bytes();
+    let mut el_10_found = false;
+    let mut openeuler_found = false;
+    let search_el = s.windows(el_10.len()).position(|window| window == el_10);
+    if search_el.is_some() {
+        el_10_found = true;
+    } else {
+        let search_openeuler = s
+            .windows(openeuler.len())
+            .position(|window| window == openeuler);
+        if search_openeuler.is_some() {
+            openeuler_found = true;
+        }
+    }
+    if !el_10_found && !openeuler_found {
+        return;
+    }
+    let mut data = OHPC4_RESULTS.write().unwrap();
+    let mut year_found = false;
+    for result in &*data {
+        if result.year == year {
+            year_found = true;
+            break;
+        }
+    }
+    if !year_found {
+        data.push(ResultOHPC4 {
+            year,
+            rhel: 0,
+            openeuler: 0,
+        });
+    }
+    for result in data.as_mut_slice() {
+        if result.year == year {
+            if el_10_found {
+                result.rhel += 1;
+            }
+            if openeuler_found {
+                result.openeuler += 1;
+            }
+            break;
+        }
+    }
+}
+
 fn month_to_int(s: &str) -> i64 {
     match s {
         "Jan" => 1,
@@ -414,6 +476,7 @@ fn process_line(s: &[u8]) {
     let mut ohpc_1 = false;
     let mut ohpc_2 = false;
     let mut ohpc_3 = false;
+    let mut ohpc_4 = false;
     let substring_1 = "/ohpc-1.3/".as_bytes();
     let search_1 = s
         .windows(substring_1.len())
@@ -538,14 +601,17 @@ fn process_line(s: &[u8]) {
             ohpc_3 = true;
             update_distributions_ohpc_3(&s[start + 2..], year);
         }
+        let substring_4 = "4/".as_bytes();
+        if &s[start..start + 2] == substring_4 {
+            OHPC_4.fetch_add(1, Ordering::SeqCst);
+            ohpc_4 = true;
+            update_distributions_ohpc_4(&s[start + 2..], year);
+        }
     }
 
     let size: u64 = match elements.len() < 10 {
         true => 0,
-        false => match elements[9].parse::<u64>() {
-            Ok(y) => y,
-            _ => 0,
-        },
+        false => elements[9].parse::<u64>().unwrap_or_default(),
     };
 
     let ip = match elements[0].parse::<IpAddr>() {
@@ -577,6 +643,10 @@ fn process_line(s: &[u8]) {
                     true => 1,
                     false => 0,
                 },
+                ohpc_4: match ohpc_4 {
+                    true => 1,
+                    false => 0,
+                },
                 overall: 1,
                 unique_ohpc_1: match ohpc_1 {
                     true => 1,
@@ -587,6 +657,10 @@ fn process_line(s: &[u8]) {
                     false => 0,
                 },
                 unique_ohpc_3: match ohpc_3 {
+                    true => 1,
+                    false => 0,
+                },
+                unique_ohpc_4: match ohpc_4 {
                     true => 1,
                     false => 0,
                 },
@@ -615,6 +689,9 @@ fn process_line(s: &[u8]) {
                     if ohpc_3 {
                         result.ohpc_3 += 1;
                     }
+                    if ohpc_4 {
+                        result.ohpc_4 += 1;
+                    }
                     let mut unique = false;
                     match ip {
                         IpAddr::V4(ipv4) => {
@@ -640,6 +717,9 @@ fn process_line(s: &[u8]) {
                         }
                         if ohpc_3 {
                             result.unique_ohpc_3 += 1;
+                        }
+                        if ohpc_4 {
+                            result.unique_ohpc_4 += 1;
                         }
                     }
                     break;
@@ -673,6 +753,10 @@ fn process_line(s: &[u8]) {
                     true => 1,
                     false => 0,
                 },
+                ohpc_4: match ohpc_4 {
+                    true => 1,
+                    false => 0,
+                },
                 overall: 1,
                 unique_ohpc_1: match ohpc_1 {
                     true => 1,
@@ -683,6 +767,10 @@ fn process_line(s: &[u8]) {
                     false => 0,
                 },
                 unique_ohpc_3: match ohpc_3 {
+                    true => 1,
+                    false => 0,
+                },
+                unique_ohpc_4: match ohpc_4 {
                     true => 1,
                     false => 0,
                 },
@@ -710,6 +798,9 @@ fn process_line(s: &[u8]) {
                     }
                     if ohpc_3 {
                         result.ohpc_3 += 1;
+                    }
+                    if ohpc_4 {
+                        result.ohpc_4 += 1;
                     }
                     let mut unique = false;
                     match ip {
@@ -744,6 +835,9 @@ fn process_line(s: &[u8]) {
                         }
                         if ohpc_3 {
                             result.unique_ohpc_3 += 1;
+                        }
+                        if ohpc_4 {
+                            result.unique_ohpc_4 += 1;
                         }
                     }
                     break;
@@ -782,6 +876,7 @@ fn main() {
         .unwrap()
         .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ");
     let pool = rayon::ThreadPoolBuilder::new().build().unwrap();
+    let re = Regex::new(r"(.*GET.*){2,}").unwrap();
 
     for input in params.access_log.clone().into_iter() {
         let pb = ProgressBar::new(0);
@@ -789,11 +884,11 @@ fn main() {
         let mut access_log = match std::fs::File::open(input.clone()) {
             Ok(a) => a,
             Err(e) => {
-                println!("Opening input file '{}' failed: {}", input, e);
+                println!("Opening input file '{input}' failed: {e}");
                 process::exit(1);
             }
         };
-        print_step(format!("Using '{:}' as input", input));
+        print_step(format!("Using '{input:}' as input"));
 
         pool.scope(|scope| {
             let mut s = Vec::with_capacity(CHUNK_SIZE);
@@ -829,8 +924,8 @@ fn main() {
 
                 // Move our string into a rayon thread.
                 let data = s;
+                let re = re.clone();
                 scope.spawn(move |_| {
-                    let re = Regex::new(r"(.*GET.*){2,}").unwrap();
                     let d_s = data[..last_newline].split(|c| *c == b'\n');
 
                     for i in d_s {
@@ -855,7 +950,7 @@ fn main() {
         });
     }
     if let Err(e) = create_plots(params, start) {
-        println!("Error creating diagrams: {}", e);
+        println!("Error creating diagrams: {e}");
         process::exit(1);
     }
 }
@@ -873,13 +968,17 @@ fn create_overall_plot() -> String {
         Bar::new(labels.clone(), vec![OHPC_3.load(Ordering::SeqCst)]).name("Release 3.x"),
     );
     plot.add_trace(
+        Bar::new(labels.clone(), vec![OHPC_4.load(Ordering::SeqCst)]).name("Release 4.x"),
+    );
+    plot.add_trace(
         Bar::new(
             labels,
             vec![
                 OVERALL.load(Ordering::SeqCst)
                     - OHPC_1.load(Ordering::SeqCst)
                     - OHPC_2.load(Ordering::SeqCst)
-                    - OHPC_3.load(Ordering::SeqCst),
+                    - OHPC_3.load(Ordering::SeqCst)
+                    - OHPC_4.load(Ordering::SeqCst),
             ],
         )
         .name("Other"),
@@ -947,6 +1046,7 @@ fn create_repository_requests_per_year(
     let mut ohpc_1: Vec<i64> = Vec::new();
     let mut ohpc_2: Vec<i64> = Vec::new();
     let mut ohpc_3: Vec<i64> = Vec::new();
+    let mut ohpc_4: Vec<i64> = Vec::new();
     let mut overall: Vec<i64> = Vec::new();
     let mut ticks: Vec<f64> = Vec::new();
     let data = OVERALL_RESULTS.read()?;
@@ -957,6 +1057,7 @@ fn create_repository_requests_per_year(
                 ohpc_1.push(result.ohpc_1);
                 ohpc_2.push(result.ohpc_2);
                 ohpc_3.push(result.ohpc_3);
+                ohpc_4.push(result.ohpc_4);
                 overall.push(result.overall);
                 ticks.push((*year) as f64);
                 break;
@@ -968,6 +1069,7 @@ fn create_repository_requests_per_year(
     plot.add_trace(Scatter::new(years.clone(), ohpc_1).name("OHPC 1.3.x"));
     plot.add_trace(Scatter::new(years.clone(), ohpc_2).name("OHPC 2.x"));
     plot.add_trace(Scatter::new(years.clone(), ohpc_3).name("OHPC 3.x"));
+    plot.add_trace(Scatter::new(years.clone(), ohpc_4).name("OHPC 4.x"));
     plot.add_trace(Scatter::new(years.clone(), overall).name("Total"));
     plot.set_layout(
         Layout::new()
@@ -986,6 +1088,7 @@ fn create_unique_repository_requests_per_year(
     let mut unique_ohpc_1: Vec<i64> = Vec::new();
     let mut unique_ohpc_2: Vec<i64> = Vec::new();
     let mut unique_ohpc_3: Vec<i64> = Vec::new();
+    let mut unique_ohpc_4: Vec<i64> = Vec::new();
     let mut unique_overall: Vec<i64> = Vec::new();
     let mut ticks: Vec<f64> = Vec::new();
 
@@ -996,6 +1099,7 @@ fn create_unique_repository_requests_per_year(
                 unique_ohpc_1.push(result.unique_ohpc_1);
                 unique_ohpc_2.push(result.unique_ohpc_2);
                 unique_ohpc_3.push(result.unique_ohpc_3);
+                unique_ohpc_4.push(result.unique_ohpc_4);
                 unique_overall.push(result.unique_overall);
                 ticks.push((*year) as f64);
                 json.unique_visitors_per_year.push(UniqueVisitorsPerYear {
@@ -1003,6 +1107,7 @@ fn create_unique_repository_requests_per_year(
                     ohpc1: result.unique_ohpc_1,
                     ohpc2: result.unique_ohpc_2,
                     ohpc3: result.unique_ohpc_3,
+                    ohpc4: result.unique_ohpc_4,
                     overall: result.unique_overall,
                 });
                 break;
@@ -1014,10 +1119,12 @@ fn create_unique_repository_requests_per_year(
     let trace_unique_ohpc_1 = Scatter::new(years.clone(), unique_ohpc_1).name("OHPC 1.3.x");
     let trace_unique_ohpc_2 = Scatter::new(years.clone(), unique_ohpc_2).name("OHPC 2.x");
     let trace_unique_ohpc_3 = Scatter::new(years.clone(), unique_ohpc_3).name("OHPC 3.x");
+    let trace_unique_ohpc_4 = Scatter::new(years.clone(), unique_ohpc_4).name("OHPC 4.x");
     let trace_unique_overall = Scatter::new(years.clone(), unique_overall).name("Total");
     unique_plot.add_trace(trace_unique_ohpc_1);
     unique_plot.add_trace(trace_unique_ohpc_2);
     unique_plot.add_trace(trace_unique_ohpc_3);
+    unique_plot.add_trace(trace_unique_ohpc_4);
     unique_plot.add_trace(trace_unique_overall);
     let unique_layout = Layout::new()
         .title("Unique OHPC repository requests per year".into())
@@ -1084,6 +1191,7 @@ fn create_repository_requests_per_month() -> Result<String, Box<dyn std::error::
     let mut ohpc_1_per_month: Vec<i64> = Vec::new();
     let mut ohpc_2_per_month: Vec<i64> = Vec::new();
     let mut ohpc_3_per_month: Vec<i64> = Vec::new();
+    let mut ohpc_4_per_month: Vec<i64> = Vec::new();
     let mut overall_per_month: Vec<i64> = Vec::new();
     let mut year_months: Vec<String> = Vec::new();
 
@@ -1099,6 +1207,7 @@ fn create_repository_requests_per_month() -> Result<String, Box<dyn std::error::
                 ohpc_1_per_month.push(result.ohpc_1);
                 ohpc_2_per_month.push(result.ohpc_2);
                 ohpc_3_per_month.push(result.ohpc_3);
+                ohpc_4_per_month.push(result.ohpc_4);
                 overall_per_month.push(result.overall);
                 break;
             }
@@ -1112,6 +1221,8 @@ fn create_repository_requests_per_month() -> Result<String, Box<dyn std::error::
         .add_trace(Scatter::new(year_months.clone(), ohpc_2_per_month).name("OHPC 2.x"));
     plot_overall_per_month
         .add_trace(Scatter::new(year_months.clone(), ohpc_3_per_month).name("OHPC 3.x"));
+    plot_overall_per_month
+        .add_trace(Scatter::new(year_months.clone(), ohpc_4_per_month).name("OHPC 4.x"));
     plot_overall_per_month
         .add_trace(Scatter::new(year_months.clone(), overall_per_month).name("Total"));
     plot_overall_per_month
@@ -1127,6 +1238,7 @@ fn create_unique_repository_requests_per_month(
     let mut unique_ohpc_1_per_month: Vec<i64> = Vec::new();
     let mut unique_ohpc_2_per_month: Vec<i64> = Vec::new();
     let mut unique_ohpc_3_per_month: Vec<i64> = Vec::new();
+    let mut unique_ohpc_4_per_month: Vec<i64> = Vec::new();
     let mut unique_overall_per_month: Vec<i64> = Vec::new();
     let mut year_months: Vec<String> = Vec::new();
 
@@ -1142,12 +1254,14 @@ fn create_unique_repository_requests_per_month(
                 unique_ohpc_1_per_month.push(result.unique_ohpc_1);
                 unique_ohpc_2_per_month.push(result.unique_ohpc_2);
                 unique_ohpc_3_per_month.push(result.unique_ohpc_3);
+                unique_ohpc_4_per_month.push(result.unique_ohpc_4);
                 unique_overall_per_month.push(result.unique_overall);
                 json.unique_visitors_per_month.push(UniqueVisitorsPerMonth {
                     year_month: year_month.clone(),
                     ohpc1: result.unique_ohpc_1,
                     ohpc2: result.unique_ohpc_2,
                     ohpc3: result.unique_ohpc_3,
+                    ohpc4: result.unique_ohpc_4,
                     overall: result.unique_overall,
                 });
                 break;
@@ -1159,6 +1273,7 @@ fn create_unique_repository_requests_per_month(
     plot.add_trace(Scatter::new(year_months.clone(), unique_ohpc_1_per_month).name("OHPC 1.3.x"));
     plot.add_trace(Scatter::new(year_months.clone(), unique_ohpc_2_per_month).name("OHPC 2.x"));
     plot.add_trace(Scatter::new(year_months.clone(), unique_ohpc_3_per_month).name("OHPC 3.x"));
+    plot.add_trace(Scatter::new(year_months.clone(), unique_ohpc_4_per_month).name("OHPC 4.x"));
     plot.add_trace(Scatter::new(year_months.clone(), unique_overall_per_month).name("Total"));
     plot.set_layout(Layout::new().title("Unique OHPC repository requests per month".into()));
 
@@ -1249,6 +1364,26 @@ fn create_repository_requests_per_year_and_distribution(
     plot.add_trace(Scatter::new(years.clone(), ohpc_3_sles).name("OHPC SLES 3.x"));
     plot.add_trace(Scatter::new(years.clone(), ohpc_3_rhel).name("OHPC RHEL 3.x"));
     plot.add_trace(Scatter::new(years.clone(), ohpc_3_openeuler).name("OHPC openEuler 3.x"));
+
+    let mut ohpc_4_rhel: Vec<i64> = Vec::new();
+    let mut ohpc_4_openeuler: Vec<i64> = Vec::new();
+    let data_ohpc_4 = OHPC4_RESULTS.read().unwrap();
+    years = Vec::new();
+    for result in &*data_ohpc_4 {
+        years.push(result.year);
+    }
+    years.sort_unstable();
+    for year in &years {
+        for result in &*data_ohpc_4 {
+            if result.year == *year {
+                ohpc_4_rhel.push(result.rhel);
+                ohpc_4_openeuler.push(result.openeuler);
+                break;
+            }
+        }
+    }
+    plot.add_trace(Scatter::new(years.clone(), ohpc_4_rhel).name("OHPC RHEL 4.x"));
+    plot.add_trace(Scatter::new(years.clone(), ohpc_4_openeuler).name("OHPC openEuler 4.x"));
 
     Ok(plot.to_inline_html(None))
 }
@@ -1562,8 +1697,7 @@ fn create_plots(params: Args, start: Instant) -> Result<(), Box<dyn std::error::
     let timestamp = chrono::Utc::now().to_rfc2822();
     file.write_all(
         format!(
-            "<center>Generated on {}. Runtime: {:?}</center>",
-            timestamp, duration
+            "<center>Generated on {timestamp}. Runtime: {duration:?}</center>"
         )
         .as_bytes(),
     )?;
@@ -1575,7 +1709,7 @@ fn create_plots(params: Args, start: Instant) -> Result<(), Box<dyn std::error::
     serde_json::to_writer(&mut writer, &json)?;
     writer.flush()?;
 
-    print_step(format!("Finished after {:?} at {}", duration, timestamp,));
+    print_step(format!("Finished after {duration:?} at {timestamp}"));
 
     Ok(())
 }

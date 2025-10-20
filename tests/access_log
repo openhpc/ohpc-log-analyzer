@@ -287,3 +287,10 @@
 5.4.3.199 - - [20/Apr/2024:18:36:01 +0000] "GET /ohpc-1.3/1.3.7/base/SLE_12/x86_64/mumps-intel-impi-ohpc-5.0.2-31.1.x86_64.rpm HTTP/1.1" 200 1915886 "-" "Mozilla/5.0 (compatible; DotBot/1.2; +https://opensiteexplorer.org/dotbot; help@moz.com)"
 5.4.3.199 - - [20/Apr/2024:18:36:15 +0000] "GET /ohpc-1.3/1.3.7/base/SLE_12/x86_64/netcdf-cxx-intel-mvapich2-ohpc-4.2.1-5.4.x86_64.rpm HTTP/1.1" 200 114644 "-" "Mozilla/5.0 (compatible; DotBot/1.2; +https://opensiteexplorer.org/dotbot; help@moz.com)"
 5.4.3.199 - - [20/Apr/2024:18:36:24 +0000] "GET /ohpc-1.3/1.3.7/base/SLE_12/x86_64/slurm-slurmdbd-ohpc-16.05.10-36.1.x86_64.rpm HTTP/1.1" 200 955092 "-" "Mozilla/5.0 (compatible; DotBot/1.2; +https://opensiteexplorer.org/dotbot; help@moz.com)"
+
+# OpenHPC 4.x test entries
+1.2.3.100 - - [15/Jan/2025:10:30:00 +0000] "GET /OpenHPC/4/EL_10/x86_64/repodata/repomd.xml HTTP/1.1" 200 1024 "-" "libdnf (Rocky Linux 10.0; generic; Linux.x86_64)"
+1.2.3.101 - - [15/Jan/2025:10:31:00 +0000] "GET /OpenHPC/4/openEuler_24.03/x86_64/packages/ohpc-base-4.0-1.el10.x86_64.rpm HTTP/1.1" 200 2048 "-" "dnf/4.20.0 (openEuler 24.03; generic; Linux.x86_64)"
+1.2.3.102 - - [15/Jan/2025:10:32:00 +0000] "GET /OpenHPC/4/EL_10/x86_64/packages/lmod-ohpc-8.8.0-1.el10.x86_64.rpm HTTP/1.1" 200 1536 "-" "libdnf (AlmaLinux 10.0; generic; Linux.x86_64)"
+1.2.3.103 - - [15/Jan/2025:10:33:00 +0000] "GET /OpenHPC/4/openEuler_24.03/x86_64/repodata/repomd.xml HTTP/1.1" 200 512 "-" "libdnf (openEuler 24.03; generic; Linux.x86_64)"
+1.2.3.104 - - [15/Jan/2025:10:34:00 +0000] "GET /OpenHPC/4/EL_10/noarch/ohpc-filesystem-4.0-1.el10.noarch.rpm HTTP/1.1" 200 1024 "-" "libdnf (Red Hat Enterprise Linux 10.0; generic; Linux.x86_64)"
