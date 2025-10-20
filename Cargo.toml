@@ -7,7 +7,7 @@ edition = "2021"
 chrono = "0.4.42"
 clap = { version = "4.3.24", features = ["derive"] }
 console = "0.16.1"
-indicatif = "0.17.11"
+indicatif = "0.18.0"
 maxminddb = "0.26.0"
 plotly =  { version = "0.8.4", features = ["kaleido"] }
 rayon = "1.10.0"
