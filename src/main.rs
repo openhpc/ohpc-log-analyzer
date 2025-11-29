@@ -1391,15 +1391,13 @@ fn fill_country_results(params: &Args) -> Result<(), Box<dyn std::error::Error>>
     for result in &*data {
         result.ipv4.par_iter().for_each(|(key, value)| {
             let client_country = match geoip_reader
-                .lookup::<maxminddb::geoip2::Country>(std::net::IpAddr::V4(Ipv4Addr::from(*key)))
+                .lookup(std::net::IpAddr::V4(Ipv4Addr::from(*key)))
+                .and_then(|r| r.decode::<maxminddb::geoip2::Country>())
             {
-                Ok(Some(c)) => match c.country {
-                    Some(co) => match co.iso_code {
-                        Some(iso) => iso.to_string(),
-                        _ => "N/A".to_string(),
-                    },
-                    _ => "N/A".to_string(),
-                },
+                Ok(Some(c)) => c
+                    .country
+                    .iso_code
+                    .map_or("N/A".to_string(), |iso| iso.to_string()),
                 _ => "N/A".to_string(),
             };
 
@@ -1427,15 +1425,13 @@ fn fill_country_results(params: &Args) -> Result<(), Box<dyn std::error::Error>>
         });
         result.ipv6.par_iter().for_each(|(key, value)| {
             let client_country = match geoip_reader
-                .lookup::<maxminddb::geoip2::Country>(std::net::IpAddr::V6(Ipv6Addr::from(*key)))
+                .lookup(std::net::IpAddr::V6(Ipv6Addr::from(*key)))
+                .and_then(|r| r.decode::<maxminddb::geoip2::Country>())
             {
-                Ok(Some(c)) => match c.country {
-                    Some(co) => match co.iso_code {
-                        Some(iso) => iso.to_string(),
-                        _ => "N/A".to_string(),
-                    },
-                    _ => "N/A".to_string(),
-                },
+                Ok(Some(c)) => c
+                    .country
+                    .iso_code
+                    .map_or("N/A".to_string(), |iso| iso.to_string()),
                 _ => "N/A".to_string(),
             };
 
