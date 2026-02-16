@@ -8,7 +8,7 @@ chrono = "0.4.43"
 clap = { version = "4.3.24", features = ["derive"] }
 console = "0.16.2"
 indicatif = "0.18.3"
-maxminddb = "0.27.1"
+maxminddb = "0.27.3"
 plotly =  { version = "0.8.4", features = ["kaleido"] }
 rayon = "1.11.0"
 regex = "1.12.3"
