@@ -932,7 +932,7 @@ fn create_overall_plot() -> String {
     plot.set_layout(
         Layout::new()
             .bar_mode(BarMode::Stack)
-            .title("OHPC overall repository accesses".into()),
+            .title("OHPC overall repository accesses"),
     );
 
     plot.to_inline_html(None)
@@ -969,7 +969,7 @@ fn create_type_plot() -> String {
 
     plot.set_layout(
         Layout::new()
-            .title("OHPC file types per year".into())
+            .title("OHPC file types per year")
             .x_axis(Axis::new().tick_values(ticks.clone())),
     );
 
@@ -1019,7 +1019,7 @@ fn create_repository_requests_per_year(
     plot.add_trace(Scatter::new(years.clone(), overall).name("Total"));
     plot.set_layout(
         Layout::new()
-            .title("OHPC repository requests per year".into())
+            .title("OHPC repository requests per year")
             .x_axis(Axis::new().tick_values(ticks.clone())),
     );
 
@@ -1073,7 +1073,7 @@ fn create_unique_repository_requests_per_year(
     unique_plot.add_trace(trace_unique_ohpc_4);
     unique_plot.add_trace(trace_unique_overall);
     let unique_layout = Layout::new()
-        .title("Unique OHPC repository requests per year".into())
+        .title("Unique OHPC repository requests per year")
         .x_axis(Axis::new().tick_values(ticks.clone()));
     unique_plot.set_layout(unique_layout);
     if !params.no_svg {
@@ -1116,7 +1116,7 @@ fn create_data_downloaded_per_year(
     let size_per_year = Scatter::new(years.clone(), size).name("Total");
     plot_size_per_year.add_trace(size_per_year);
     let layout_size_per_year = Layout::new()
-        .title("OHPC data downloaded per year".into())
+        .title("OHPC data downloaded per year")
         .x_axis(Axis::new().tick_values(ticks.clone()));
     plot_size_per_year.set_layout(layout_size_per_year);
 
@@ -1172,7 +1172,7 @@ fn create_repository_requests_per_month() -> Result<String, Box<dyn std::error::
     plot_overall_per_month
         .add_trace(Scatter::new(year_months.clone(), overall_per_month).name("Total"));
     plot_overall_per_month
-        .set_layout(Layout::new().title("OHPC repository requests per month".into()));
+        .set_layout(Layout::new().title("OHPC repository requests per month"));
 
     Ok(plot_overall_per_month.to_inline_html(None))
 }
@@ -1221,7 +1221,7 @@ fn create_unique_repository_requests_per_month(
     plot.add_trace(Scatter::new(year_months.clone(), unique_ohpc_3_per_month).name("OHPC 3.x"));
     plot.add_trace(Scatter::new(year_months.clone(), unique_ohpc_4_per_month).name("OHPC 4.x"));
     plot.add_trace(Scatter::new(year_months.clone(), unique_overall_per_month).name("Total"));
-    plot.set_layout(Layout::new().title("Unique OHPC repository requests per month".into()));
+    plot.set_layout(Layout::new().title("Unique OHPC repository requests per month"));
 
     if !params.no_svg {
         plot.write_image(
@@ -1263,7 +1263,7 @@ fn create_repository_requests_per_year_and_distribution(
     plot.add_trace(Scatter::new(years.clone(), ohpc_1_rhel).name("OHPC RHEL 1.3.x"));
     plot.set_layout(
         Layout::new()
-            .title("OHPC repository requests per year and distribution".into())
+            .title("OHPC repository requests per year and distribution")
             .x_axis(Axis::new().tick_values(ticks.clone())),
     );
 
@@ -1362,7 +1362,7 @@ fn create_data_downloaded_per_month(
 
     let mut plot = Plot::new();
     plot.add_trace(Scatter::new(year_months.clone(), size_per_month).name("Total"));
-    plot.set_layout(Layout::new().title("OHPC data downloaded per month".into()));
+    plot.set_layout(Layout::new().title("OHPC data downloaded per month"));
 
     if !params.no_svg {
         plot.write_image(
@@ -1516,7 +1516,7 @@ fn create_country_per_year_and_month(
     }
 
     let mut plot = Plot::new();
-    let layout_country = Layout::new().title("OHPC repository country requests per month".into());
+    let layout_country = Layout::new().title("OHPC repository country requests per month");
     plot.set_layout(layout_country);
 
     for result in country_results.keys() {
@@ -1590,7 +1590,7 @@ fn create_libdnf_requests_per_year_and_distribution(
 
     let mut plot_libdnf = Plot::new();
     let layout_libdnf = Layout::new()
-        .title("OHPC repository libdnf requests per year and distribution".into())
+        .title("OHPC repository libdnf requests per year and distribution")
         .x_axis(Axis::new().tick_values(ticks));
     plot_libdnf.set_layout(layout_libdnf);
 
