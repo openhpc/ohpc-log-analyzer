@@ -779,7 +779,7 @@ pub fn print_step(msg: String) {
     );
 }
 
-const CHUNK_SIZE: usize = 100_000_000;
+const CHUNK_SIZE: usize = 4_000_000;
 
 fn main() {
     let start = Instant::now();
