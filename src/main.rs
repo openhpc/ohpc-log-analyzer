@@ -1655,7 +1655,11 @@ fn create_libdnf_requests_per_year_and_distribution(
         .x_axis(Axis::new().tick_values(ticks));
     plot_libdnf.set_layout(layout_libdnf);
 
-    for result in libdnf_results.keys() {
+    // Iterating the map directly would emit the traces in hash order, so the
+    // legend and the colour of every distribution changed from run to run.
+    let mut names: Vec<&String> = libdnf_results.keys().collect();
+    names.sort_unstable();
+    for result in names {
         let trace_libdnf = Scatter::new(
             libdnf_results[result].years.clone(),
             libdnf_results[result].count.clone(),
