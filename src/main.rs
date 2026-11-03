@@ -1386,77 +1386,57 @@ fn fill_country_results(params: &Args) -> Result<(), Box<dyn std::error::Error>>
         }
     };
 
+    fn lookup(reader: &maxminddb::Reader<Vec<u8>>, ip: IpAddr) -> String {
+        match reader
+            .lookup(ip)
+            .and_then(|r| r.decode::<maxminddb::geoip2::Country>())
+        {
+            Ok(Some(c)) => c
+                .country
+                .iso_code
+                .map_or("N/A".to_string(), |iso| iso.to_string()),
+            _ => "N/A".to_string(),
+        }
+    }
+
+    fn merge(mut a: FxHashMap<String, i64>, b: FxHashMap<String, i64>) -> FxHashMap<String, i64> {
+        for (k, v) in b {
+            *a.entry(k).or_insert(0) += v;
+        }
+        a
+    }
+
     let data = OVERALL_RESULTS_PER_MONTH.read()?;
+    let mut country_results = COUNTRY_RESULTS.write().unwrap();
 
     for result in &*data {
-        result.ipv4.par_iter().for_each(|(key, value)| {
-            let client_country = match geoip_reader
-                .lookup(std::net::IpAddr::V4(Ipv4Addr::from(*key)))
-                .and_then(|r| r.decode::<maxminddb::geoip2::Country>())
-            {
-                Ok(Some(c)) => c
-                    .country
-                    .iso_code
-                    .map_or("N/A".to_string(), |iso| iso.to_string()),
-                _ => "N/A".to_string(),
-            };
+        let v4 = result
+            .ipv4
+            .par_iter()
+            .fold(FxHashMap::default, |mut acc, (key, value)| {
+                let c = lookup(&geoip_reader, IpAddr::V4(Ipv4Addr::from(*key)));
+                *acc.entry(c).or_insert(0) += *value;
+                acc
+            })
+            .reduce(FxHashMap::default, merge);
+        let v6 = result
+            .ipv6
+            .par_iter()
+            .fold(FxHashMap::default, |mut acc, (key, value)| {
+                let c = lookup(&geoip_reader, IpAddr::V6(Ipv6Addr::from(*key)));
+                *acc.entry(c).or_insert(0) += *value;
+                acc
+            })
+            .reduce(FxHashMap::default, merge);
 
-            let mut country_results = COUNTRY_RESULTS.write().unwrap();
-
-            let mut found = false;
-            for country_result in country_results.as_mut_slice() {
-                if country_result.year == result.year
-                    && country_result.country == client_country
-                    && country_result.month == result.month
-                {
-                    country_result.count += *value;
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                country_results.push(ResultCountry {
-                    year: result.year,
-                    month: result.month,
-                    country: client_country,
-                    count: *value,
-                });
-            }
-        });
-        result.ipv6.par_iter().for_each(|(key, value)| {
-            let client_country = match geoip_reader
-                .lookup(std::net::IpAddr::V6(Ipv6Addr::from(*key)))
-                .and_then(|r| r.decode::<maxminddb::geoip2::Country>())
-            {
-                Ok(Some(c)) => c
-                    .country
-                    .iso_code
-                    .map_or("N/A".to_string(), |iso| iso.to_string()),
-                _ => "N/A".to_string(),
-            };
-
-            let mut country_results = COUNTRY_RESULTS.write().unwrap();
-
-            let mut found = false;
-            for country_result in country_results.as_mut_slice() {
-                if country_result.year == result.year
-                    && country_result.country == client_country
-                    && country_result.month == result.month
-                {
-                    country_result.count += *value;
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                country_results.push(ResultCountry {
-                    year: result.year,
-                    month: result.month,
-                    country: client_country,
-                    count: *value,
-                });
-            }
-        });
+        for (country, count) in merge(v4, v6) {
+            country_results.push(ResultCountry {
+                year: result.year,
+                month: result.month,
+                country,
+                count,
+            });
+        }
     }
 
     Ok(())
@@ -1468,58 +1448,47 @@ fn create_country_per_year_and_month(
 ) -> Result<String, Box<dyn std::error::Error>> {
     fill_country_results(params)?;
 
-    let mut year_months: Vec<String> = Vec::new();
-    let mut countries: Vec<String> = Vec::new();
-
-    let data = COUNTRY_RESULTS.read()?;
-    for result in &*data {
-        year_months.push(format!("{}-{:02}", result.year, result.month));
-        countries.push(result.country.clone());
-    }
-    year_months.sort_unstable();
-    year_months.dedup();
-    countries.sort_unstable();
-    countries.dedup();
-
-    #[derive(Debug)]
+    #[derive(Debug, Default)]
     struct CountryTraceResults {
         year_months: Vec<String>,
         count: Vec<i64>,
     }
 
-    let mut country_results: FxHashMap<String, CountryTraceResults> = FxHashMap::default();
+    let data = COUNTRY_RESULTS.read()?;
 
-    for country in &countries {
-        for year_month in &year_months {
-            for result in &*data {
-                if format!("{}-{:02}", result.year, result.month) == (*year_month).clone()
-                    && result.country == *country
-                {
-                    let values = match country_results.entry((*country.clone()).to_string()) {
-                        Entry::Occupied(o) => o.into_mut(),
-                        Entry::Vacant(v) => v.insert(CountryTraceResults {
-                            year_months: Vec::new(),
-                            count: Vec::new(),
-                        }),
-                    };
-                    values.year_months.push((*year_month).clone());
-                    values.count.push(result.count);
-                    json.result_country.push(ResultCountry {
-                        year: result.year,
-                        month: result.month,
-                        country: (*country.clone()).to_string(),
-                        count: result.count,
-                    });
-                }
-            }
-        }
+    // Sort row indices by (country, year, month) once instead of scanning the
+    // whole table for every (country, year_month) combination.
+    let mut order: Vec<usize> = (0..data.len()).collect();
+    order.sort_unstable_by(|a, b| {
+        let (x, y) = (&data[*a], &data[*b]);
+        x.country
+            .cmp(&y.country)
+            .then(x.year.cmp(&y.year))
+            .then(x.month.cmp(&y.month))
+    });
+
+    let mut country_results: FxHashMap<String, CountryTraceResults> = FxHashMap::default();
+    for i in order {
+        let result = &data[i];
+        let year_month = format!("{}-{:02}", result.year, result.month);
+        let values = country_results.entry(result.country.clone()).or_default();
+        values.year_months.push(year_month);
+        values.count.push(result.count);
+        json.result_country.push(ResultCountry {
+            year: result.year,
+            month: result.month,
+            country: result.country.clone(),
+            count: result.count,
+        });
     }
 
     let mut plot = Plot::new();
     let layout_country = Layout::new().title("OHPC repository country requests per month");
     plot.set_layout(layout_country);
 
-    for result in country_results.keys() {
+    let mut names: Vec<&String> = country_results.keys().collect();
+    names.sort_unstable();
+    for result in names {
         let trace_countries = Scatter::new(
             country_results[result].year_months.clone(),
             country_results[result].count.clone(),
