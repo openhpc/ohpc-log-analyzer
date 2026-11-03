@@ -130,6 +130,37 @@ if ! grep -qE '^[0-9.]+ (B|kB|MB|GB|TB|PB)$' "${SVG_DEST}/size_per_year.svg"; th
 	exit 1
 fi
 
+# Nothing may be left behind by the temporary files the atomic publish uses.
+if ls "${SVG_DEST}"/*.tmp >/dev/null 2>&1; then
+	echo "ERROR: a successful run left .tmp files behind"
+	ls -la "${SVG_DEST}"
+	exit 1
+fi
+
+# A run that fails partway through must leave the previously published page
+# untouched rather than replacing it with a truncated one. An unreadable
+# GeoIP database fails in the last chart, well after the point where the old
+# code had already truncated index.html.
+GOOD_PAGE=$(sha256sum <"${SVG_DEST}/index.html")
+
+if "${OHPC_LOG_ANALYZER}" --output-directory "${SVG_DEST}" \
+	--geoip "${SVG_DEST}/does-not-exist.mmdb" tests/access_log; then
+	echo "ERROR: the run with a missing GeoIP database was expected to fail"
+	exit 1
+fi
+
+if [ "$(sha256sum <"${SVG_DEST}/index.html")" != "${GOOD_PAGE}" ]; then
+	echo "ERROR: a failed run damaged the published index.html"
+	ls -la "${SVG_DEST}"
+	exit 1
+fi
+
+if ls "${SVG_DEST}"/*.tmp >/dev/null 2>&1; then
+	echo "ERROR: a failed run left .tmp files behind"
+	ls -la "${SVG_DEST}"
+	exit 1
+fi
+
 rm -rf "${SVG_DEST}"
 
 jq '.' "${DEST}"/stats.json

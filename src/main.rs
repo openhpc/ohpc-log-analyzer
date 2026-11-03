@@ -4,7 +4,7 @@ extern crate serde;
 
 use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{
     Read,
     Write,
@@ -14,7 +14,7 @@ use std::net::{
     Ipv4Addr,
     Ipv6Addr,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{
     AtomicUsize,
     Ordering,
@@ -912,6 +912,34 @@ fn format_bytes(v: f64) -> String {
 /// This replaces plotly's Kaleido export, which needed an external renderer
 /// binary on the machine and was deprecated upstream. plotters renders SVG in
 /// pure Rust, so nothing outside the binary is required.
+// Publishing a file by writing straight into it exposes every intermediate
+// state to anyone fetching it, and leaves a truncated file behind if the run
+// dies partway through. Write to a temporary file beside the destination and
+// rename it into place instead: rename is atomic within a filesystem, so a
+// reader sees either the previous file or the complete new one, and a failed
+// run leaves the previous file untouched.
+fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+
+    let result = (|| -> std::io::Result<()> {
+        let mut file = File::create(&tmp)?;
+        file.write_all(contents)?;
+        // Rename only orders the directory entry against the file contents if
+        // those contents have reached the disk, so flush before renaming.
+        file.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+
+    if result.is_err() {
+        // Do not leave the partial file lying next to the published one.
+        let _ = fs::remove_file(&tmp);
+    }
+
+    Ok(result?)
+}
+
 // A chart that cannot be rendered must not take the HTML page down with it.
 // Before this the error propagated out of create_plots, which had already
 // truncated the published index.html, so one failing SVG left the site
@@ -938,7 +966,8 @@ fn render_svg_chart(
     if x_labels.is_empty() {
         return Ok(());
     }
-    let root = SVGBackend::new(path, (1600, 600)).into_drawing_area();
+    let mut buf = String::new();
+    let root = SVGBackend::with_string(&mut buf, (1600, 600)).into_drawing_area();
     root.fill(&WHITE)?;
 
     let y_max = series
@@ -983,7 +1012,10 @@ fn render_svg_chart(
         .draw()?;
 
     root.present()?;
-    Ok(())
+    drop(root);
+    drop(chart);
+
+    write_atomic(path, buf.as_bytes())
 }
 
 fn create_overall_plot() -> String {
@@ -1702,37 +1734,44 @@ fn create_plots(params: Args, start: Instant) -> Result<(), Box<dyn std::error::
         result_country: Vec::new(),
     };
 
-    let mut file = File::create(Path::new(&params.output_directory).join(&params.html_output))?;
-    file.write_all(HTML_HEADER.as_bytes())?;
-    file.write_all(create_repository_requests_per_year(&years)?.as_bytes())?;
-    file.write_all(
-        create_unique_repository_requests_per_year(&years, &params, &mut json)?.as_bytes(),
-    )?;
-    file.write_all(create_repository_requests_per_month()?.as_bytes())?;
-    file.write_all(create_unique_repository_requests_per_month(&params, &mut json)?.as_bytes())?;
-    file.write_all(create_data_downloaded_per_year(&years, &params, &mut json)?.as_bytes())?;
-    file.write_all(create_data_downloaded_per_month(&params, &mut json)?.as_bytes())?;
-    file.write_all(create_repository_requests_per_year_and_distribution()?.as_bytes())?;
-    file.write_all(create_libdnf_requests_per_year_and_distribution(&mut json)?.as_bytes())?;
-    file.write_all(create_overall_plot().as_bytes())?;
-    file.write_all(create_type_plot().as_bytes())?;
-    file.write_all(create_country_per_year_and_month(&params, &mut json)?.as_bytes())?;
-    file.write_all("</div>".as_bytes())?;
+    // The page is assembled in memory and published in one atomic rename at
+    // the end. Writing it chart by chart into the live file meant the
+    // published page was truncated for the whole of create_plots, and stayed
+    // truncated if any chart failed.
+    let mut page = String::with_capacity(512 * 1024);
+    page.push_str(HTML_HEADER);
+    page.push_str(&create_repository_requests_per_year(&years)?);
+    page.push_str(&create_unique_repository_requests_per_year(
+        &years, &params, &mut json,
+    )?);
+    page.push_str(&create_repository_requests_per_month()?);
+    page.push_str(&create_unique_repository_requests_per_month(
+        &params, &mut json,
+    )?);
+    page.push_str(&create_data_downloaded_per_year(&years, &params, &mut json)?);
+    page.push_str(&create_data_downloaded_per_month(&params, &mut json)?);
+    page.push_str(&create_repository_requests_per_year_and_distribution()?);
+    page.push_str(&create_libdnf_requests_per_year_and_distribution(&mut json)?);
+    page.push_str(&create_overall_plot());
+    page.push_str(&create_type_plot());
+    page.push_str(&create_country_per_year_and_month(&params, &mut json)?);
+    page.push_str("</div>");
+
     let duration = start.elapsed();
     let timestamp = chrono::Utc::now().to_rfc2822();
-    file.write_all(
-        format!(
-            "<center>Generated on {timestamp}. Runtime: {duration:?}</center>"
-        )
-        .as_bytes(),
-    )?;
-    file.write_all(HTML_FOOTER.as_bytes())?;
+    page.push_str(&format!(
+        "<center>Generated on {timestamp}. Runtime: {duration:?}</center>"
+    ));
+    page.push_str(HTML_FOOTER);
 
-    let mut writer = std::io::BufWriter::new(File::create(
-        Path::new(&params.output_directory).join("stats.json"),
-    )?);
-    serde_json::to_writer(&mut writer, &json)?;
-    writer.flush()?;
+    write_atomic(
+        &Path::new(&params.output_directory).join(&params.html_output),
+        page.as_bytes(),
+    )?;
+    write_atomic(
+        &Path::new(&params.output_directory).join("stats.json"),
+        &serde_json::to_vec(&json)?,
+    )?;
 
     print_step(format!("Finished after {duration:?} at {timestamp}"));
 
