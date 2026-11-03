@@ -272,6 +272,82 @@ if [ "${PAGE_MODE}" = "600" ]; then
 	exit 1
 fi
 
+# An entry whose input file has gone away is of no further use and has to be
+# removed, or a rotated daily log leaves its entry behind for good.
+PRUNE_CACHE=$(mktemp -d)
+PRUNE_LOGS=$(mktemp -d)
+PRUNE_OUT=$(mktemp -d)
+cp tests/access_log "${PRUNE_LOGS}/access_log_a"
+cp tests/access_log "${PRUNE_LOGS}/access_log_b"
+"${OHPC_LOG_ANALYZER}" --no-svg --cache-directory "${PRUNE_CACHE}" \
+	--output-directory "${PRUNE_OUT}" "${PRUNE_LOGS}/access_log_a" \
+	"${PRUNE_LOGS}/access_log_b"
+
+if [ "$(find "${PRUNE_CACHE}" -name '*.counts' | wc -l)" != "2" ]; then
+	echo "ERROR: expected one cache entry per input file"
+	exit 1
+fi
+
+# Leaving an input out of a run must not drop its entry: a run over a subset
+# of the logs would otherwise throw away the rest of the cache.
+"${OHPC_LOG_ANALYZER}" --no-svg --cache-directory "${PRUNE_CACHE}" \
+	--output-directory "${PRUNE_OUT}" "${PRUNE_LOGS}/access_log_b"
+
+if [ "$(find "${PRUNE_CACHE}" -name '*.counts' | wc -l)" != "2" ]; then
+	echo "ERROR: a run over a subset of the logs pruned entries still in use"
+	exit 1
+fi
+
+# Deleting the log itself is what makes the entry prunable.
+rm -f "${PRUNE_LOGS}/access_log_a"
+"${OHPC_LOG_ANALYZER}" --no-svg --cache-directory "${PRUNE_CACHE}" \
+	--output-directory "${PRUNE_OUT}" "${PRUNE_LOGS}/access_log_b"
+
+if [ "$(find "${PRUNE_CACHE}" -name '*.counts' | wc -l)" != "1" ]; then
+	echo "ERROR: the entry of a deleted log was not pruned"
+	ls -la "${PRUNE_CACHE}"
+	exit 1
+fi
+
+# The surviving entry has to be the one still in use, not either one.
+PRUNE_RUN=$("${OHPC_LOG_ANALYZER}" --no-svg --cache-directory "${PRUNE_CACHE}" \
+	--output-directory "${PRUNE_OUT}" "${PRUNE_LOGS}/access_log_b")
+if ! printf '%s' "${PRUNE_RUN}" |
+	grep -qF "Using the cached counts for '${PRUNE_LOGS}/access_log_b'"; then
+	echo "ERROR: the wrong cache entry survived the prune"
+	printf '%s\n' "${PRUNE_RUN}"
+	exit 1
+fi
+
+# An entry from another format version can never be used again either. It
+# has to be checked on an entry this run does not rewrite anyway, or the
+# write would hide a prune that never happened.
+VERSION_CACHE=$(mktemp -d)
+cp tests/access_log "${PRUNE_LOGS}/access_log_a"
+"${OHPC_LOG_ANALYZER}" --no-svg --cache-directory "${VERSION_CACHE}" \
+	--output-directory "${PRUNE_OUT}" "${PRUNE_LOGS}/access_log_a"
+STALE_ENTRY=$(find "${VERSION_CACHE}" -name '*.counts')
+printf '\x09\x00\x00\x00' |
+	dd of="${STALE_ENTRY}" bs=1 seek=8 conv=notrunc status=none
+
+# access_log_a still exists, so only the version makes this entry prunable.
+"${OHPC_LOG_ANALYZER}" --no-svg --cache-directory "${VERSION_CACHE}" \
+	--output-directory "${PRUNE_OUT}" "${PRUNE_LOGS}/access_log_b"
+
+if [ -e "${STALE_ENTRY}" ]; then
+	echo "ERROR: an entry of a foreign CACHE_VERSION was not pruned"
+	ls -la "${VERSION_CACHE}"
+	exit 1
+fi
+if [ "$(find "${VERSION_CACHE}" -name '*.counts' | wc -l)" != "1" ]; then
+	echo "ERROR: the prune did not leave exactly the entry of this run"
+	ls -la "${VERSION_CACHE}"
+	exit 1
+fi
+rm -rf "${VERSION_CACHE}"
+
+rm -rf "${PRUNE_CACHE}" "${PRUNE_LOGS}" "${PRUNE_OUT}"
+
 rm -rf "${CACHE_DIR}" "${CACHE_LOG}" "${COLD}" "${WARM}" "${GROWN}" \
 	"${PLAIN_GROWN}" "${CORRUPT}"
 

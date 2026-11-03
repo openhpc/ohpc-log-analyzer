@@ -4,7 +4,7 @@ extern crate serde;
 
 use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
-use std::fs;
+use std::fs::{self, File};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::io::{
     Read,
@@ -731,6 +731,80 @@ fn write_cache(
     write_private(&cache_path(cache_dir, input), &e.0)
 }
 
+/// The input path an entry was written for, or `None` when the entry is not
+/// one this binary can use.
+///
+/// Only the header is read. An entry runs to megabytes, so decoding every
+/// address set just to find out which file an entry belongs to would cost
+/// far more than the prune saves.
+fn read_cache_header(path: &Path) -> Option<String> {
+    // PATH_MAX is 4096 on Linux, so a buffer twice that always holds the
+    // magic, the version and the whole path.
+    let mut head = [0_u8; 8192];
+    let mut file = File::open(path).ok()?;
+    let read = file.read(&mut head).ok()?;
+    let mut d = Dec {
+        b: &head[..read],
+        pos: 0,
+    };
+
+    if d.take(CACHE_MAGIC.len())? != CACHE_MAGIC || d.u32()? != CACHE_VERSION {
+        return None;
+    }
+
+    String::from_utf8(d.bytes()?.to_vec()).ok()
+}
+
+/// Deletes the entries the cache has no further use for.
+///
+/// Nothing else removes them, so without this a daily log that has been
+/// folded into its monthly file and deleted leaves its entry behind for
+/// good, and the directory grows without limit.
+fn prune_cache(cache_dir: &Path) {
+    let entries = match fs::read_dir(cache_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!(
+                "Reading the cache directory '{}' failed: {e}",
+                cache_dir.display()
+            );
+            return;
+        }
+    };
+
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("counts") {
+            continue;
+        }
+
+        let stale = match read_cache_header(&path) {
+            // Corrupt, truncated, or written by another CACHE_VERSION: no
+            // run can use it again, so it is only taking up space.
+            None => true,
+            // A relative path was resolved against a working directory this
+            // run need not share, so testing it here could delete an entry
+            // that is in fact still in use. Only an absolute path is checked.
+            Some(input) => {
+                let input = Path::new(&input);
+                input.is_absolute() && !input.exists()
+            }
+        };
+
+        if stale {
+            match fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                Err(e) => eprintln!("Removing '{}' failed: {e}", path.display()),
+            }
+        }
+    }
+
+    if removed > 0 {
+        print_step(format!("Removed {removed} unused cache entries"));
+    }
+}
+
 fn merge_chunk(counts: ChunkCounts) {
     OVERALL.fetch_add(counts.lines, Ordering::Relaxed);
     OHPC_1.fetch_add(counts.release_lines[0], Ordering::Relaxed);
@@ -1313,6 +1387,11 @@ fn main() {
             merge_chunk(counts);
         }
     }
+
+    if let Some(dir) = &cache_dir {
+        prune_cache(dir);
+    }
+
     if let Err(e) = create_plots(params, start) {
         println!("Error creating diagrams: {e}");
         process::exit(1);
