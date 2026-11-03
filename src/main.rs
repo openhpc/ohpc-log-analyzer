@@ -4,7 +4,7 @@ extern crate serde;
 
 use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{
     Read,
     Write,
@@ -14,7 +14,7 @@ use std::net::{
     Ipv4Addr,
     Ipv6Addr,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{
     AtomicUsize,
     Ordering,
@@ -22,6 +22,7 @@ use std::sync::atomic::{
 use std::sync::{
     Arc,
     LazyLock,
+    Mutex,
     RwLock,
 };
 use std::time::Instant;
@@ -102,6 +103,12 @@ struct Args {
     /// GeoIP mmdb database
     #[arg(long, default_value = "/usr/share/GeoIP/GeoLite2-Country.mmdb")]
     geoip: String,
+
+    /// Directory holding the per input file counter cache. When it is set,
+    /// the counts for each input file are stored there and reused for as
+    /// long as that file is unchanged, so a rotated log is parsed only once.
+    #[arg(long)]
+    cache_directory: Option<String>,
 
     /// One or multiple access logs
     access_log: Vec<String>,
@@ -320,6 +327,407 @@ where
             data.len() - 1
         }
     }
+}
+
+// Everything a chunk contributes is already collected in ChunkCounts, and
+// merging two of them is associative, so a whole input file can be folded
+// into a single ChunkCounts and kept on disk. A log file that has been
+// rotated never changes again, which means the 33 GB of historical logs are
+// parsed once and only read back as counters afterwards.
+fn merge_counts(dst: &mut ChunkCounts, src: ChunkCounts) {
+    dst.lines += src.lines;
+    for (i, v) in src.release_lines.iter().enumerate() {
+        dst.release_lines[i] += v;
+    }
+
+    for (year, y) in src.years {
+        let e = dst.years.entry(year).or_default();
+        e.overall += y.overall;
+        e.size += y.size;
+        for (i, v) in y.ohpc.iter().enumerate() {
+            e.ohpc[i] += v;
+        }
+        for (ip, releases) in y.ipv4 {
+            *e.ipv4.entry(ip).or_insert(0) |= releases;
+        }
+        for (ip, releases) in y.ipv6 {
+            *e.ipv6.entry(ip).or_insert(0) |= releases;
+        }
+    }
+
+    for (key, m) in src.months {
+        let e = dst.months.entry(key).or_default();
+        e.overall += m.overall;
+        e.size += m.size;
+        for (i, v) in m.ohpc.iter().enumerate() {
+            e.ohpc[i] += v;
+        }
+        for (ip, stats) in m.ipv4 {
+            let slot = e.ipv4.entry(ip).or_default();
+            slot.requests += stats.requests;
+            slot.releases |= stats.releases;
+        }
+        for (ip, stats) in m.ipv6 {
+            let slot = e.ipv6.entry(ip).or_default();
+            slot.requests += stats.requests;
+            slot.releases |= stats.releases;
+        }
+    }
+
+    for (year, c) in src.ohpc1 {
+        let e = dst.ohpc1.entry(year).or_default();
+        for (i, v) in c.iter().enumerate() {
+            e[i] += v;
+        }
+    }
+    for (year, c) in src.ohpc2 {
+        let e = dst.ohpc2.entry(year).or_default();
+        for (i, v) in c.iter().enumerate() {
+            e[i] += v;
+        }
+    }
+    for (year, c) in src.ohpc3 {
+        let e = dst.ohpc3.entry(year).or_default();
+        for (i, v) in c.iter().enumerate() {
+            e[i] += v;
+        }
+    }
+    for (year, c) in src.ohpc4 {
+        let e = dst.ohpc4.entry(year).or_default();
+        for (i, v) in c.iter().enumerate() {
+            e[i] += v;
+        }
+    }
+    for (year, c) in src.types {
+        let e = dst.types.entry(year).or_default();
+        for (i, v) in c.iter().enumerate() {
+            e[i] += v;
+        }
+    }
+
+    for (name, per_year) in src.libdnf {
+        let e = dst.libdnf.entry(name).or_default();
+        for (year, count) in per_year {
+            *e.entry(year).or_insert(0) += count;
+        }
+    }
+}
+
+// Bump this whenever a change to the parsing alters the counts a given log
+// file produces. A cache entry written by a different version is ignored and
+// the file is parsed again, so forgetting to bump it is the one way to get
+// stale numbers out of this program.
+const CACHE_VERSION: u32 = 1;
+const CACHE_MAGIC: &[u8; 8] = b"OHPCLOG\0";
+
+struct Enc(Vec<u8>);
+
+impl Enc {
+    fn u8(&mut self, v: u8) {
+        self.0.push(v);
+    }
+    fn u32(&mut self, v: u32) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn u64(&mut self, v: u64) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn i64(&mut self, v: i64) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn u128(&mut self, v: u128) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn bytes(&mut self, b: &[u8]) {
+        self.u64(b.len() as u64);
+        self.0.extend_from_slice(b);
+    }
+}
+
+struct Dec<'a> {
+    b: &'a [u8],
+    pos: usize,
+}
+
+// Every read is checked and returns None on a short or malformed entry. A
+// cache file that cannot be decoded is treated as absent, never as an error
+// and never as a panic, so a truncated or corrupt entry only costs a reparse.
+impl<'a> Dec<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        let out = self.b.get(self.pos..end)?;
+        self.pos = end;
+        Some(out)
+    }
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn i64(&mut self) -> Option<i64> {
+        Some(i64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn u128(&mut self) -> Option<u128> {
+        Some(u128::from_le_bytes(self.take(16)?.try_into().ok()?))
+    }
+    // A corrupt length must not make the program reserve gigabytes, so a
+    // count is only accepted when at least that many bytes are still left.
+    fn count(&mut self) -> Option<usize> {
+        let n = usize::try_from(self.u64()?).ok()?;
+        match n <= self.b.len().saturating_sub(self.pos) {
+            true => Some(n),
+            false => None,
+        }
+    }
+    fn bytes(&mut self) -> Option<&'a [u8]> {
+        let n = self.count()?;
+        self.take(n)
+    }
+}
+
+fn encode_counts(counts: &ChunkCounts) -> Vec<u8> {
+    let mut e = Enc(Vec::with_capacity(1 << 20));
+    e.u64(counts.lines as u64);
+    for v in counts.release_lines {
+        e.u64(v as u64);
+    }
+
+    e.u64(counts.years.len() as u64);
+    for (year, y) in &counts.years {
+        e.i64(*year);
+        e.i64(y.overall);
+        e.u64(y.size);
+        for v in y.ohpc {
+            e.i64(v);
+        }
+        e.u64(y.ipv4.len() as u64);
+        for (ip, releases) in &y.ipv4 {
+            e.u32(*ip);
+            e.u8(*releases);
+        }
+        e.u64(y.ipv6.len() as u64);
+        for (ip, releases) in &y.ipv6 {
+            e.u128(*ip);
+            e.u8(*releases);
+        }
+    }
+
+    e.u64(counts.months.len() as u64);
+    for ((year, month), m) in &counts.months {
+        e.i64(*year);
+        e.i64(*month);
+        e.i64(m.overall);
+        e.u64(m.size);
+        for v in m.ohpc {
+            e.i64(v);
+        }
+        e.u64(m.ipv4.len() as u64);
+        for (ip, stats) in &m.ipv4 {
+            e.u32(*ip);
+            e.i64(stats.requests);
+            e.u8(stats.releases);
+        }
+        e.u64(m.ipv6.len() as u64);
+        for (ip, stats) in &m.ipv6 {
+            e.u128(*ip);
+            e.i64(stats.requests);
+            e.u8(stats.releases);
+        }
+    }
+
+    for map in [&counts.ohpc1, &counts.ohpc2, &counts.ohpc4] {
+        e.u64(map.len() as u64);
+        for (year, c) in map.iter() {
+            e.i64(*year);
+            for v in c {
+                e.i64(*v);
+            }
+        }
+    }
+    for map in [&counts.ohpc3, &counts.types] {
+        e.u64(map.len() as u64);
+        for (year, c) in map.iter() {
+            e.i64(*year);
+            for v in c {
+                e.i64(*v);
+            }
+        }
+    }
+
+    e.u64(counts.libdnf.len() as u64);
+    for (name, per_year) in &counts.libdnf {
+        e.bytes(name.as_bytes());
+        e.u64(per_year.len() as u64);
+        for (year, count) in per_year {
+            e.i64(*year);
+            e.i64(*count);
+        }
+    }
+
+    e.0
+}
+
+fn decode_counts(d: &mut Dec) -> Option<ChunkCounts> {
+    let mut counts = ChunkCounts {
+        lines: usize::try_from(d.u64()?).ok()?,
+        ..Default::default()
+    };
+    for slot in counts.release_lines.iter_mut() {
+        *slot = usize::try_from(d.u64()?).ok()?;
+    }
+
+    for _ in 0..d.count()? {
+        let year = d.i64()?;
+        let mut y = YearCounts {
+            overall: d.i64()?,
+            size: d.u64()?,
+            ..Default::default()
+        };
+        for slot in y.ohpc.iter_mut() {
+            *slot = d.i64()?;
+        }
+        for _ in 0..d.count()? {
+            y.ipv4.insert(d.u32()?, d.u8()?);
+        }
+        for _ in 0..d.count()? {
+            y.ipv6.insert(d.u128()?, d.u8()?);
+        }
+        counts.years.insert(year, y);
+    }
+
+    for _ in 0..d.count()? {
+        let year = d.i64()?;
+        let month = d.i64()?;
+        let mut m = MonthCounts {
+            overall: d.i64()?,
+            size: d.u64()?,
+            ..Default::default()
+        };
+        for slot in m.ohpc.iter_mut() {
+            *slot = d.i64()?;
+        }
+        for _ in 0..d.count()? {
+            let ip = d.u32()?;
+            m.ipv4.insert(ip, IpStats {
+                requests: d.i64()?,
+                releases: d.u8()?,
+            });
+        }
+        for _ in 0..d.count()? {
+            let ip = d.u128()?;
+            m.ipv6.insert(ip, IpStats {
+                requests: d.i64()?,
+                releases: d.u8()?,
+            });
+        }
+        counts.months.insert((year, month), m);
+    }
+
+    for map in [&mut counts.ohpc1, &mut counts.ohpc2, &mut counts.ohpc4] {
+        for _ in 0..d.count()? {
+            let year = d.i64()?;
+            map.insert(year, [d.i64()?, d.i64()?]);
+        }
+    }
+    for map in [&mut counts.ohpc3, &mut counts.types] {
+        for _ in 0..d.count()? {
+            let year = d.i64()?;
+            map.insert(year, [d.i64()?, d.i64()?, d.i64()?]);
+        }
+    }
+
+    for _ in 0..d.count()? {
+        let name = String::from_utf8(d.bytes()?.to_vec()).ok()?;
+        let mut per_year = FxHashMap::default();
+        for _ in 0..d.count()? {
+            per_year.insert(d.i64()?, d.i64()?);
+        }
+        counts.libdnf.insert(name, per_year);
+    }
+
+    Some(counts)
+}
+
+// Identity of an input file. A cache entry is only used when all of these
+// still match, so a log that was rotated, appended to or replaced is parsed
+// again. The daily log still grows, so it is reparsed every run; the files
+// that make up the bulk of the input no longer are.
+struct FileId {
+    len: u64,
+    mtime_secs: i64,
+    mtime_nanos: u32,
+    inode: u64,
+}
+
+fn file_id(meta: &std::fs::Metadata) -> FileId {
+    use std::os::unix::fs::MetadataExt;
+    FileId {
+        len: meta.len(),
+        mtime_secs: meta.mtime(),
+        mtime_nanos: meta.mtime_nsec() as u32,
+        inode: meta.ino(),
+    }
+}
+
+// The cache file is named after a hash of the input path so that logs from
+// different directories cannot collide, and the path is stored in the entry
+// as well so a hash collision is caught rather than silently believed.
+fn cache_path(cache_dir: &Path, input: &str) -> PathBuf {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for b in input.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    cache_dir.join(format!("{hash:016x}.counts"))
+}
+
+fn read_cache(cache_dir: &Path, input: &str, id: &FileId) -> Option<ChunkCounts> {
+    let raw = fs::read(cache_path(cache_dir, input)).ok()?;
+    let mut d = Dec { b: &raw, pos: 0 };
+
+    if d.take(CACHE_MAGIC.len())? != CACHE_MAGIC {
+        return None;
+    }
+    if d.u32()? != CACHE_VERSION {
+        return None;
+    }
+    if d.bytes()? != input.as_bytes() {
+        return None;
+    }
+    if d.u64()? != id.len
+        || d.i64()? != id.mtime_secs
+        || d.u32()? != id.mtime_nanos
+        || d.u64()? != id.inode
+    {
+        return None;
+    }
+
+    decode_counts(&mut d)
+}
+
+fn write_cache(
+    cache_dir: &Path,
+    input: &str,
+    id: &FileId,
+    counts: &ChunkCounts,
+) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(cache_dir)?;
+
+    let mut e = Enc(Vec::new());
+    e.0.extend_from_slice(CACHE_MAGIC);
+    e.u32(CACHE_VERSION);
+    e.bytes(input.as_bytes());
+    e.u64(id.len);
+    e.i64(id.mtime_secs);
+    e.u32(id.mtime_nanos);
+    e.u64(id.inode);
+    e.0.extend_from_slice(&encode_counts(counts));
+
+    write_atomic(&cache_path(cache_dir, input), &e.0)
 }
 
 fn merge_chunk(counts: ChunkCounts) {
@@ -797,6 +1205,8 @@ fn main() {
     let pool = rayon::ThreadPoolBuilder::new().build().unwrap();
     let max_in_flight = 2 * pool.current_num_threads();
 
+    let cache_dir = params.cache_directory.as_ref().map(PathBuf::from);
+
     for input in params.access_log.clone().into_iter() {
         let pb = ProgressBar::new(0);
         pb.set_style(spinner_style.clone());
@@ -807,7 +1217,27 @@ fn main() {
                 process::exit(1);
             }
         };
+        // A rotated log never changes again, so its counters are taken from
+        // the cache and the file itself is not read at all.
+        let id = access_log.metadata().as_ref().map(file_id).ok();
+        if let (Some(dir), Some(id)) = (&cache_dir, &id) {
+            if let Some(counts) = read_cache(dir, &input, id) {
+                print_step(format!("Using the cached counts for '{input}'"));
+                merge_chunk(counts);
+                continue;
+            }
+        }
+
         print_step(format!("Using '{input:}' as input"));
+
+        // With a cache the chunks are folded into one ChunkCounts per file so
+        // that it can be stored; without one they go straight into the
+        // globals as before, which keeps the default memory profile the same.
+        let file_counts = cache_dir
+            .as_ref()
+            .and(id.as_ref())
+            .map(|_| Mutex::new(ChunkCounts::default()));
+        let accumulator = file_counts.as_ref();
 
         pool.in_place_scope(|scope| {
             let mut s = Vec::with_capacity(CHUNK_SIZE);
@@ -861,13 +1291,26 @@ fn main() {
                         }
                         process_line(i, &mut counts);
                     }
-                    merge_chunk(counts);
+                    match accumulator {
+                        Some(acc) => merge_counts(&mut acc.lock().unwrap(), counts),
+                        _ => merge_chunk(counts),
+                    }
                     CHUNKS_IN_FLIGHT.fetch_sub(1, Ordering::Release);
                 });
                 s = next_s;
             }
             pb.finish();
         });
+
+        if let (Some(dir), Some(id), Some(acc)) = (&cache_dir, &id, file_counts) {
+            let counts = acc.into_inner().unwrap_or_default();
+            // A cache that cannot be written only costs the next run some
+            // time, so it must not stop this one from publishing its page.
+            if let Err(e) = write_cache(dir, &input, id, &counts) {
+                eprintln!("Writing the cache entry for '{input}' failed: {e}");
+            }
+            merge_chunk(counts);
+        }
     }
     if let Err(e) = create_plots(params, start) {
         println!("Error creating diagrams: {e}");
@@ -912,92 +1355,367 @@ fn format_bytes(v: f64) -> String {
 /// This replaces plotly's Kaleido export, which needed an external renderer
 /// binary on the machine and was deprecated upstream. plotters renders SVG in
 /// pure Rust, so nothing outside the binary is required.
+// Publishing a file by writing straight into it exposes every intermediate
+// state to anyone fetching it, and leaves a truncated file behind if the run
+// dies partway through. Write to a temporary file beside the destination and
+// rename it into place instead: rename is atomic within a filesystem, so a
+// reader sees either the previous file or the complete new one, and a failed
+// run leaves the previous file untouched.
+fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    // The process id keeps two runs writing the same destination from
+    // interleaving into one temporary file and renaming the result into
+    // place, which would publish exactly the corrupt file this avoids.
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(format!(".{}.tmp", process::id()));
+    let tmp = PathBuf::from(tmp);
+
+    let result = (|| -> std::io::Result<()> {
+        let mut file = File::create(&tmp)?;
+        file.write_all(contents)?;
+        // Rename only orders the directory entry against the file contents if
+        // those contents have reached the disk, so flush before renaming.
+        file.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+
+    if result.is_err() {
+        // Do not leave the partial file lying next to the published one.
+        let _ = fs::remove_file(&tmp);
+    }
+
+    Ok(result?)
+}
+
+/// How a chart is drawn. The HTML page uses a stacked bar chart for the
+/// overall accesses and lines everywhere else.
+#[derive(Clone, Copy, PartialEq)]
+enum ChartStyle {
+    Lines,
+    StackedBars,
+}
+
+/// A legend naming every series stops being readable long before the couple
+/// of hundred countries the country chart has, so above this many series
+/// only the largest ones are named. The others are still drawn.
+const MAX_LEGEND_ENTRIES: usize = 12;
+
+/// Colour for series `i`. The first five are the fixed palette the charts
+/// have always used, so the charts that had an SVG before keep their
+/// colours; beyond that the hue is rotated by the golden angle and the
+/// lightness cycled, which keeps dozens of series apart reasonably well.
+fn series_color(i: usize) -> RGBColor {
+    if let Some(color) = SERIES_COLORS.get(i) {
+        return *color;
+    }
+    let n = (i - SERIES_COLORS.len()) as f64;
+    let hue = (n * 137.507_764_05) % 360.0;
+    let lightness = match i % 3 {
+        0 => 0.35,
+        1 => 0.50,
+        _ => 0.65,
+    };
+    hsl_to_rgb(hue, 0.65, lightness)
+}
+
+fn hsl_to_rgb(h: f64, s: f64, l: f64) -> RGBColor {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r, g, b) = match (h / 60.0) as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    RGBColor(
+        ((r + m) * 255.0).round() as u8,
+        ((g + m) * 255.0).round() as u8,
+        ((b + m) * 255.0).round() as u8,
+    )
+}
+
+/// One chart series: a name and the points it has, each tagged with the
+/// label of the position on the x axis it belongs to. The series of a chart
+/// do not all cover the same range -- a release that only appeared in 2024
+/// has no earlier points, and most countries are missing from most months --
+/// so every point carries its own label rather than relying on position.
+type SvgSeries = (String, Vec<(String, f64)>);
+
+// A chart that cannot be rendered must not take the HTML page down with it.
+// Before this the error propagated out of create_plots, which had already
+// truncated the published index.html, so one failing SVG left the site
+// showing nothing but the charts written before it.
 fn write_svg_chart(
     path: &Path,
     title: &str,
-    x_labels: &[String],
-    series: &[(&str, Vec<f64>)],
+    series: &[SvgSeries],
     y_format: fn(f64) -> String,
+    style: ChartStyle,
+) {
+    if let Err(e) = render_svg_chart(path, title, series, y_format, style) {
+        eprintln!("Rendering {} failed: {e}", path.display());
+    }
+}
+
+fn render_svg_chart(
+    path: &Path,
+    title: &str,
+    series: &[SvgSeries],
+    y_format: fn(f64) -> String,
+    style: ChartStyle,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // The x axis is the sorted union of every label any series mentions.
+    // Years and zero padded year-months both sort into the right order as
+    // strings, which is the order the HTML charts use as well.
+    let mut x_labels: Vec<&str> = series
+        .iter()
+        .flat_map(|(_, points)| points.iter().map(|(label, _)| label.as_str()))
+        .collect();
+    x_labels.sort_unstable();
+    x_labels.dedup();
+
     if x_labels.is_empty() {
         return Ok(());
     }
-    let root = SVGBackend::new(path, (1600, 600)).into_drawing_area();
-    root.fill(&WHITE)?;
 
-    let y_max = series
+    let index: FxHashMap<&str, usize> = x_labels
         .iter()
-        .flat_map(|(_, values)| values.iter().copied())
-        .fold(0.0_f64, f64::max);
+        .enumerate()
+        .map(|(i, label)| (*label, i))
+        .collect();
+
+    // A stacked chart is as tall as the whole stack, not as its largest
+    // single contribution.
+    let y_max = match style {
+        ChartStyle::Lines => series
+            .iter()
+            .flat_map(|(_, points)| points.iter().map(|(_, v)| *v))
+            .fold(0.0_f64, f64::max),
+        ChartStyle::StackedBars => {
+            let mut totals = vec![0.0_f64; x_labels.len()];
+            for (_, points) in series {
+                for (label, v) in points {
+                    if let Some(i) = index.get(label.as_str()) {
+                        totals[*i] += *v;
+                    }
+                }
+            }
+            totals.iter().copied().fold(0.0_f64, f64::max)
+        }
+    };
     // Leave a little headroom so the highest point is not on the frame.
     let y_max = if y_max > 0.0 { y_max * 1.05 } else { 1.0 };
-    let x_max = x_labels.len().saturating_sub(1).max(1) as i32;
 
-    let mut chart = ChartBuilder::on(&root)
-        .caption(title, ("sans-serif", 28))
-        .margin(20)
-        .x_label_area_size(60)
-        .y_label_area_size(110)
-        .build_cartesian_2d(0_i32..x_max, 0.0_f64..y_max)?;
-
-    chart
-        .configure_mesh()
-        .x_labels(x_labels.len().min(12))
-        .x_label_formatter(&|v| x_labels.get(*v as usize).cloned().unwrap_or_default())
-        .y_label_formatter(&|v| y_format(*v))
-        .draw()?;
-
-    for (i, (name, values)) in series.iter().enumerate() {
-        let color = SERIES_COLORS[i % SERIES_COLORS.len()];
-        chart
-            .draw_series(LineSeries::new(
-                values.iter().enumerate().map(|(x, y)| (x as i32, *y)),
-                color.stroke_width(2),
-            ))?
-            .label(*name)
-            .legend(move |(x, y)| {
-                PathElement::new(vec![(x, y), (x + 20, y)], color.stroke_width(2))
-            });
+    // Name every series while they still fit, otherwise only the tallest
+    // ones. Picking a subset never reorders the legend, because the entries
+    // are drawn in the order the series are added either way.
+    let mut labelled = vec![series.len() <= MAX_LEGEND_ENTRIES; series.len()];
+    if series.len() > MAX_LEGEND_ENTRIES {
+        let peak = |s: &SvgSeries| {
+            s.1.iter()
+                .map(|(_, v)| *v)
+                .fold(f64::NEG_INFINITY, f64::max)
+        };
+        let mut order: Vec<usize> = (0..series.len()).collect();
+        // The index breaks ties so the choice does not depend on the sort.
+        order.sort_by(|a, b| {
+            peak(&series[*b])
+                .partial_cmp(&peak(&series[*a]))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(b))
+        });
+        for i in order.into_iter().take(MAX_LEGEND_ENTRIES) {
+            labelled[i] = true;
+        }
     }
 
-    chart
-        .configure_series_labels()
-        .background_style(WHITE.mix(0.85))
-        .border_style(BLACK)
-        .draw()?;
+    let mut buf = String::new();
+    {
+        let root = SVGBackend::with_string(&mut buf, (1600, 600)).into_drawing_area();
+        root.fill(&WHITE)?;
 
-    root.present()?;
-    Ok(())
+        let caption = (title, ("sans-serif", 28));
+        let label_text = |v: f64| -> String {
+            let nearest = v.round();
+            match (v - nearest).abs() > 1e-6 || nearest < 0.0 {
+                true => String::new(),
+                false => x_labels
+                    .get(nearest as usize)
+                    .map(|l| (*l).to_string())
+                    .unwrap_or_default(),
+            }
+        };
+
+        match style {
+            ChartStyle::Lines => {
+                let x_max = x_labels.len().saturating_sub(1).max(1) as i32;
+                let mut chart = ChartBuilder::on(&root)
+                    .caption(caption.0, caption.1)
+                    .margin(20)
+                    .x_label_area_size(60)
+                    .y_label_area_size(110)
+                    .build_cartesian_2d(0_i32..x_max, 0.0_f64..y_max)?;
+
+                chart
+                    .configure_mesh()
+                    .x_labels(x_labels.len().min(12))
+                    .x_label_formatter(&|v| label_text(*v as f64))
+                    .y_label_formatter(&|v| y_format(*v))
+                    .draw()?;
+
+                for (i, (name, points)) in series.iter().enumerate() {
+                    let color = series_color(i);
+                    let mut line: Vec<(i32, f64)> = points
+                        .iter()
+                        .filter_map(|(label, v)| Some((*index.get(label.as_str())? as i32, *v)))
+                        .collect();
+                    line.sort_by_key(|(x, _)| *x);
+
+                    let drawn = chart.draw_series(LineSeries::new(line, color.stroke_width(2)))?;
+                    if labelled[i] {
+                        drawn.label(name.as_str()).legend(move |(x, y)| {
+                            PathElement::new(vec![(x, y), (x + 20, y)], color.stroke_width(2))
+                        });
+                    }
+                }
+
+                chart
+                    .configure_series_labels()
+                    .background_style(WHITE.mix(0.85))
+                    .border_style(BLACK)
+                    .draw()?;
+            }
+            ChartStyle::StackedBars => {
+                let mut chart = ChartBuilder::on(&root)
+                    .caption(caption.0, caption.1)
+                    .margin(20)
+                    .x_label_area_size(60)
+                    .y_label_area_size(110)
+                    .build_cartesian_2d(-0.5_f64..(x_labels.len() as f64 - 0.5), 0.0_f64..y_max)?;
+
+                chart
+                    .configure_mesh()
+                    .x_labels(x_labels.len().min(12))
+                    .x_label_formatter(&|v| label_text(*v))
+                    .y_label_formatter(&|v| y_format(*v))
+                    .draw()?;
+
+                // Each series sits on top of the ones already drawn, which
+                // is what BarMode::Stack does in the HTML chart.
+                let mut bottoms = vec![0.0_f64; x_labels.len()];
+                for (i, (name, points)) in series.iter().enumerate() {
+                    let color = series_color(i);
+                    let mut bars = Vec::new();
+                    for (label, v) in points {
+                        let Some(slot) = index.get(label.as_str()) else {
+                            continue;
+                        };
+                        let bottom = bottoms[*slot];
+                        let top = bottom + *v;
+                        bottoms[*slot] = top;
+                        let x = *slot as f64;
+                        bars.push(Rectangle::new(
+                            [(x - 0.3, bottom), (x + 0.3, top)],
+                            color.filled(),
+                        ));
+                    }
+
+                    let drawn = chart.draw_series(bars)?;
+                    if labelled[i] {
+                        drawn.label(name.as_str()).legend(move |(x, y)| {
+                            Rectangle::new([(x, y - 5), (x + 20, y + 5)], color.filled())
+                        });
+                    }
+                }
+
+                chart
+                    .configure_series_labels()
+                    .background_style(WHITE.mix(0.85))
+                    .border_style(BLACK)
+                    .draw()?;
+            }
+        }
+
+        root.present()?;
+    }
+
+    write_atomic(path, buf.as_bytes())
 }
 
-fn create_overall_plot() -> String {
+/// Build one series that has its own x range, from the labels it covers
+/// and the values belonging to them.
+fn ragged_series(name: &str, labels: &[String], values: &[i64]) -> SvgSeries {
+    (
+        name.to_string(),
+        labels
+            .iter()
+            .cloned()
+            .zip(values.iter().map(|v| *v as f64))
+            .collect(),
+    )
+}
+
+/// The labels of a chart whose x axis is a list of years.
+fn year_labels(years: &[i64]) -> Vec<String> {
+    years.iter().map(|y| y.to_string()).collect()
+}
+
+/// Build the series for a chart whose series all cover the same labels.
+fn aligned_series(labels: &[String], series: &[(&str, Vec<f64>)]) -> Vec<SvgSeries> {
+    series
+        .iter()
+        .map(|(name, values)| {
+            (
+                (*name).to_string(),
+                labels
+                    .iter()
+                    .cloned()
+                    .zip(values.iter().copied())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
+}
+
+fn create_overall_plot(params: &Args) -> String {
     let labels = vec!["Accesses"];
-    let mut plot = Plot::new();
-    plot.add_trace(
-        Bar::new(labels.clone(), vec![OHPC_1.load(Ordering::SeqCst)]).name("Release 1.3.x"),
-    );
-    plot.add_trace(
-        Bar::new(labels.clone(), vec![OHPC_2.load(Ordering::SeqCst)]).name("Release 2.x"),
-    );
-    plot.add_trace(
-        Bar::new(labels.clone(), vec![OHPC_3.load(Ordering::SeqCst)]).name("Release 3.x"),
-    );
-    plot.add_trace(
-        Bar::new(labels.clone(), vec![OHPC_4.load(Ordering::SeqCst)]).name("Release 4.x"),
-    );
-    plot.add_trace(
-        Bar::new(
-            labels,
-            vec![
-                OVERALL.load(Ordering::SeqCst)
-                    - OHPC_1.load(Ordering::SeqCst)
-                    - OHPC_2.load(Ordering::SeqCst)
-                    - OHPC_3.load(Ordering::SeqCst)
-                    - OHPC_4.load(Ordering::SeqCst),
+    let ohpc_1 = OHPC_1.load(Ordering::SeqCst);
+    let ohpc_2 = OHPC_2.load(Ordering::SeqCst);
+    let ohpc_3 = OHPC_3.load(Ordering::SeqCst);
+    let ohpc_4 = OHPC_4.load(Ordering::SeqCst);
+    let other = OVERALL
+        .load(Ordering::SeqCst)
+        .saturating_sub(ohpc_1 + ohpc_2 + ohpc_3 + ohpc_4);
+
+    if !params.no_svg {
+        // The HTML chart stacks these five bars on one category, so the SVG
+        // does the same rather than putting them side by side.
+        let accesses = |name: &str, value: usize| -> SvgSeries {
+            (name.to_string(), vec![("Accesses".to_string(), value as f64)])
+        };
+        write_svg_chart(
+            &Path::new(&params.output_directory).join("overall_accesses.svg"),
+            "OHPC overall repository accesses",
+            &[
+                accesses("Release 1.3.x", ohpc_1),
+                accesses("Release 2.x", ohpc_2),
+                accesses("Release 3.x", ohpc_3),
+                accesses("Release 4.x", ohpc_4),
+                accesses("Other", other),
             ],
-        )
-        .name("Other"),
-    );
+            format_count,
+            ChartStyle::StackedBars,
+        );
+    }
+
+    let mut plot = Plot::new();
+    plot.add_trace(Bar::new(labels.clone(), vec![ohpc_1]).name("Release 1.3.x"));
+    plot.add_trace(Bar::new(labels.clone(), vec![ohpc_2]).name("Release 2.x"));
+    plot.add_trace(Bar::new(labels.clone(), vec![ohpc_3]).name("Release 3.x"));
+    plot.add_trace(Bar::new(labels.clone(), vec![ohpc_4]).name("Release 4.x"));
+    plot.add_trace(Bar::new(labels, vec![other]).name("Other"));
     plot.set_layout(
         Layout::new()
             .bar_mode(BarMode::Stack)
@@ -1007,7 +1725,7 @@ fn create_overall_plot() -> String {
     plot.to_inline_html(None)
 }
 
-fn create_type_plot() -> String {
+fn create_type_plot(params: &Args) -> String {
     let mut years: Vec<i64> = Vec::new();
     let mut ticks: Vec<f64> = Vec::new();
     let data = TYPE_RESULTS.read().unwrap();
@@ -1029,6 +1747,23 @@ fn create_type_plot() -> String {
                 break;
             }
         }
+    }
+
+    if !params.no_svg {
+        write_svg_chart(
+            &Path::new(&params.output_directory).join("file_types_per_year.svg"),
+            "OHPC file types per year",
+            &aligned_series(
+                &year_labels(&years),
+                &[
+                    ("TAR", counts_to_f64(&tar)),
+                    ("RPM", counts_to_f64(&rpm)),
+                    ("repomd.xml", counts_to_f64(&repomd_xml)),
+                ],
+            ),
+            format_count,
+            ChartStyle::Lines,
+        );
     }
 
     let mut plot = Plot::new();
@@ -1057,6 +1792,7 @@ fn get_years(years: &mut Vec<i64>) -> Result<(), Box<dyn std::error::Error>> {
 
 fn create_repository_requests_per_year(
     years: &Vec<i64>,
+    params: &Args,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut ohpc_1: Vec<i64> = Vec::new();
     let mut ohpc_2: Vec<i64> = Vec::new();
@@ -1078,6 +1814,25 @@ fn create_repository_requests_per_year(
                 break;
             }
         }
+    }
+
+    if !params.no_svg {
+        write_svg_chart(
+            &Path::new(&params.output_directory).join("requests_per_year.svg"),
+            "OHPC repository requests per year",
+            &aligned_series(
+                &year_labels(years),
+                &[
+                    ("OHPC 1.3.x", counts_to_f64(&ohpc_1)),
+                    ("OHPC 2.x", counts_to_f64(&ohpc_2)),
+                    ("OHPC 3.x", counts_to_f64(&ohpc_3)),
+                    ("OHPC 4.x", counts_to_f64(&ohpc_4)),
+                    ("Total", counts_to_f64(&overall)),
+                ],
+            ),
+            format_count,
+            ChartStyle::Lines,
+        );
     }
 
     let mut plot = Plot::new();
@@ -1134,16 +1889,19 @@ fn create_unique_repository_requests_per_year(
         write_svg_chart(
             &Path::new(&params.output_directory).join("unique_visitors_per_year.svg"),
             "Unique OHPC repository requests per year",
-            &years.iter().map(|y| y.to_string()).collect::<Vec<_>>(),
-            &[
-                ("OHPC 1.3.x", counts_to_f64(&unique_ohpc_1)),
-                ("OHPC 2.x", counts_to_f64(&unique_ohpc_2)),
-                ("OHPC 3.x", counts_to_f64(&unique_ohpc_3)),
-                ("OHPC 4.x", counts_to_f64(&unique_ohpc_4)),
-                ("Total", counts_to_f64(&unique_overall)),
-            ],
+            &aligned_series(
+                &years.iter().map(|y| y.to_string()).collect::<Vec<_>>(),
+                &[
+                    ("OHPC 1.3.x", counts_to_f64(&unique_ohpc_1)),
+                    ("OHPC 2.x", counts_to_f64(&unique_ohpc_2)),
+                    ("OHPC 3.x", counts_to_f64(&unique_ohpc_3)),
+                    ("OHPC 4.x", counts_to_f64(&unique_ohpc_4)),
+                    ("Total", counts_to_f64(&unique_overall)),
+                ],
+            ),
             format_count,
-        )?;
+            ChartStyle::Lines,
+        );
     }
 
     let mut unique_plot = Plot::new();
@@ -1192,10 +1950,13 @@ fn create_data_downloaded_per_year(
         write_svg_chart(
             &Path::new(&params.output_directory).join("size_per_year.svg"),
             "OHPC data downloaded per year",
-            &years.iter().map(|y| y.to_string()).collect::<Vec<_>>(),
-            &[("Total", sizes_to_f64(&size))],
+            &aligned_series(
+                &years.iter().map(|y| y.to_string()).collect::<Vec<_>>(),
+                &[("Total", sizes_to_f64(&size))],
+            ),
             format_bytes,
-        )?;
+            ChartStyle::Lines,
+        );
     }
 
     let mut plot_size_per_year = Plot::new();
@@ -1209,7 +1970,9 @@ fn create_data_downloaded_per_year(
     Ok(plot_size_per_year.to_inline_html(None))
 }
 
-fn create_repository_requests_per_month() -> Result<String, Box<dyn std::error::Error>> {
+fn create_repository_requests_per_month(
+    params: &Args,
+) -> Result<String, Box<dyn std::error::Error>> {
     let mut ohpc_1_per_month: Vec<i64> = Vec::new();
     let mut ohpc_2_per_month: Vec<i64> = Vec::new();
     let mut ohpc_3_per_month: Vec<i64> = Vec::new();
@@ -1234,6 +1997,25 @@ fn create_repository_requests_per_month() -> Result<String, Box<dyn std::error::
                 break;
             }
         }
+    }
+
+    if !params.no_svg {
+        write_svg_chart(
+            &Path::new(&params.output_directory).join("requests_per_month.svg"),
+            "OHPC repository requests per month",
+            &aligned_series(
+                &year_months,
+                &[
+                    ("OHPC 1.3.x", counts_to_f64(&ohpc_1_per_month)),
+                    ("OHPC 2.x", counts_to_f64(&ohpc_2_per_month)),
+                    ("OHPC 3.x", counts_to_f64(&ohpc_3_per_month)),
+                    ("OHPC 4.x", counts_to_f64(&ohpc_4_per_month)),
+                    ("Total", counts_to_f64(&overall_per_month)),
+                ],
+            ),
+            format_count,
+            ChartStyle::Lines,
+        );
     }
 
     let mut plot_overall_per_month = Plot::new();
@@ -1295,16 +2077,19 @@ fn create_unique_repository_requests_per_month(
         write_svg_chart(
             &Path::new(&params.output_directory).join("unique_visitors_per_month.svg"),
             "Unique OHPC repository requests per month",
-            &year_months,
-            &[
-                ("OHPC 1.3.x", counts_to_f64(&unique_ohpc_1_per_month)),
-                ("OHPC 2.x", counts_to_f64(&unique_ohpc_2_per_month)),
-                ("OHPC 3.x", counts_to_f64(&unique_ohpc_3_per_month)),
-                ("OHPC 4.x", counts_to_f64(&unique_ohpc_4_per_month)),
-                ("Total", counts_to_f64(&unique_overall_per_month)),
-            ],
+            &aligned_series(
+                &year_months,
+                &[
+                    ("OHPC 1.3.x", counts_to_f64(&unique_ohpc_1_per_month)),
+                    ("OHPC 2.x", counts_to_f64(&unique_ohpc_2_per_month)),
+                    ("OHPC 3.x", counts_to_f64(&unique_ohpc_3_per_month)),
+                    ("OHPC 4.x", counts_to_f64(&unique_ohpc_4_per_month)),
+                    ("Total", counts_to_f64(&unique_overall_per_month)),
+                ],
+            ),
             format_count,
-        )?;
+            ChartStyle::Lines,
+        );
     }
 
     let mut plot = Plot::new();
@@ -1319,6 +2104,7 @@ fn create_unique_repository_requests_per_month(
 }
 
 fn create_repository_requests_per_year_and_distribution(
+    params: &Args,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut ohpc_1_sles: Vec<i64> = Vec::new();
     let mut ohpc_1_rhel: Vec<i64> = Vec::new();
@@ -1340,6 +2126,20 @@ fn create_repository_requests_per_year_and_distribution(
             }
         }
     }
+    // Each release covers its own span of years, so the series are built
+    // with the labels they actually have rather than a shared axis.
+    let mut svg: Vec<SvgSeries> = Vec::new();
+    svg.push(ragged_series(
+        "OHPC SLES 1.3.x",
+        &year_labels(&years),
+        &ohpc_1_sles,
+    ));
+    svg.push(ragged_series(
+        "OHPC RHEL 1.3.x",
+        &year_labels(&years),
+        &ohpc_1_rhel,
+    ));
+
     let mut plot = Plot::new();
     plot.add_trace(Scatter::new(years.clone(), ohpc_1_sles).name("OHPC SLES 1.3.x"));
     plot.add_trace(Scatter::new(years.clone(), ohpc_1_rhel).name("OHPC RHEL 1.3.x"));
@@ -1367,6 +2167,16 @@ fn create_repository_requests_per_year_and_distribution(
             }
         }
     }
+    svg.push(ragged_series(
+        "OHPC SLES 2.x",
+        &year_labels(&years),
+        &ohpc_2_sles,
+    ));
+    svg.push(ragged_series(
+        "OHPC RHEL 2.x",
+        &year_labels(&years),
+        &ohpc_2_rhel,
+    ));
     plot.add_trace(Scatter::new(years.clone(), ohpc_2_sles).name("OHPC SLES 2.x"));
     plot.add_trace(Scatter::new(years.clone(), ohpc_2_rhel).name("OHPC RHEL 2.x"));
 
@@ -1389,6 +2199,21 @@ fn create_repository_requests_per_year_and_distribution(
             }
         }
     }
+    svg.push(ragged_series(
+        "OHPC SLES 3.x",
+        &year_labels(&years),
+        &ohpc_3_sles,
+    ));
+    svg.push(ragged_series(
+        "OHPC RHEL 3.x",
+        &year_labels(&years),
+        &ohpc_3_rhel,
+    ));
+    svg.push(ragged_series(
+        "OHPC openEuler 3.x",
+        &year_labels(&years),
+        &ohpc_3_openeuler,
+    ));
     plot.add_trace(Scatter::new(years.clone(), ohpc_3_sles).name("OHPC SLES 3.x"));
     plot.add_trace(Scatter::new(years.clone(), ohpc_3_rhel).name("OHPC RHEL 3.x"));
     plot.add_trace(Scatter::new(years.clone(), ohpc_3_openeuler).name("OHPC openEuler 3.x"));
@@ -1410,8 +2235,29 @@ fn create_repository_requests_per_year_and_distribution(
             }
         }
     }
+    svg.push(ragged_series(
+        "OHPC RHEL 4.x",
+        &year_labels(&years),
+        &ohpc_4_rhel,
+    ));
+    svg.push(ragged_series(
+        "OHPC openEuler 4.x",
+        &year_labels(&years),
+        &ohpc_4_openeuler,
+    ));
     plot.add_trace(Scatter::new(years.clone(), ohpc_4_rhel).name("OHPC RHEL 4.x"));
     plot.add_trace(Scatter::new(years.clone(), ohpc_4_openeuler).name("OHPC openEuler 4.x"));
+
+    if !params.no_svg {
+        write_svg_chart(
+            &Path::new(&params.output_directory)
+                .join("requests_per_year_and_distribution.svg"),
+            "OHPC repository requests per year and distribution",
+            &svg,
+            format_count,
+            ChartStyle::Lines,
+        );
+    }
 
     Ok(plot.to_inline_html(None))
 }
@@ -1446,10 +2292,10 @@ fn create_data_downloaded_per_month(
         write_svg_chart(
             &Path::new(&params.output_directory).join("size_per_month.svg"),
             "OHPC data downloaded per month",
-            &year_months,
-            &[("Total", sizes_to_f64(&size_per_month))],
+            &aligned_series(&year_months, &[("Total", sizes_to_f64(&size_per_month))]),
             format_bytes,
-        )?;
+            ChartStyle::Lines,
+        );
     }
 
     let mut plot = Plot::new();
@@ -1580,7 +2426,13 @@ fn create_country_per_year_and_month(
 
     let mut names: Vec<&String> = country_results.keys().collect();
     names.sort_unstable();
+    let mut svg: Vec<SvgSeries> = Vec::new();
     for result in names {
+        svg.push(ragged_series(
+            result,
+            &country_results[result].year_months,
+            &country_results[result].count,
+        ));
         let trace_countries = Scatter::new(
             country_results[result].year_months.clone(),
             country_results[result].count.clone(),
@@ -1589,11 +2441,22 @@ fn create_country_per_year_and_month(
         plot.add_trace(trace_countries);
     }
 
+    if !params.no_svg {
+        write_svg_chart(
+            &Path::new(&params.output_directory).join("country_per_month.svg"),
+            "OHPC repository country requests per month",
+            &svg,
+            format_count,
+            ChartStyle::Lines,
+        );
+    }
+
     Ok(plot.to_inline_html(None))
 }
 
 fn create_libdnf_requests_per_year_and_distribution(
     json: &mut Json,
+    params: &Args,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut ticks: Vec<f64> = Vec::new();
     let data_libdnf = LIBDNF_RESULTS.read()?;
@@ -1655,13 +2518,34 @@ fn create_libdnf_requests_per_year_and_distribution(
         .x_axis(Axis::new().tick_values(ticks));
     plot_libdnf.set_layout(layout_libdnf);
 
-    for result in libdnf_results.keys() {
+    // Iterating the map directly would emit the traces in hash order, so the
+    // legend and the colour of every distribution changed from run to run.
+    let mut names: Vec<&String> = libdnf_results.keys().collect();
+    names.sort_unstable();
+    let mut svg: Vec<SvgSeries> = Vec::new();
+    for result in names {
+        svg.push(ragged_series(
+            result,
+            &year_labels(&libdnf_results[result].years),
+            &libdnf_results[result].count,
+        ));
         let trace_libdnf = Scatter::new(
             libdnf_results[result].years.clone(),
             libdnf_results[result].count.clone(),
         )
         .name(result);
         plot_libdnf.add_trace(trace_libdnf);
+    }
+
+    if !params.no_svg {
+        write_svg_chart(
+            &Path::new(&params.output_directory)
+                .join("libdnf_per_year_and_distribution.svg"),
+            "OHPC repository libdnf requests per year and distribution",
+            &svg,
+            format_count,
+            ChartStyle::Lines,
+        );
     }
 
     Ok(plot_libdnf.to_inline_html(None))
@@ -1682,37 +2566,46 @@ fn create_plots(params: Args, start: Instant) -> Result<(), Box<dyn std::error::
         result_country: Vec::new(),
     };
 
-    let mut file = File::create(Path::new(&params.output_directory).join(&params.html_output))?;
-    file.write_all(HTML_HEADER.as_bytes())?;
-    file.write_all(create_repository_requests_per_year(&years)?.as_bytes())?;
-    file.write_all(
-        create_unique_repository_requests_per_year(&years, &params, &mut json)?.as_bytes(),
-    )?;
-    file.write_all(create_repository_requests_per_month()?.as_bytes())?;
-    file.write_all(create_unique_repository_requests_per_month(&params, &mut json)?.as_bytes())?;
-    file.write_all(create_data_downloaded_per_year(&years, &params, &mut json)?.as_bytes())?;
-    file.write_all(create_data_downloaded_per_month(&params, &mut json)?.as_bytes())?;
-    file.write_all(create_repository_requests_per_year_and_distribution()?.as_bytes())?;
-    file.write_all(create_libdnf_requests_per_year_and_distribution(&mut json)?.as_bytes())?;
-    file.write_all(create_overall_plot().as_bytes())?;
-    file.write_all(create_type_plot().as_bytes())?;
-    file.write_all(create_country_per_year_and_month(&params, &mut json)?.as_bytes())?;
-    file.write_all("</div>".as_bytes())?;
+    // The page is assembled in memory and published in one atomic rename at
+    // the end. Writing it chart by chart into the live file meant the
+    // published page was truncated for the whole of create_plots, and stayed
+    // truncated if any chart failed.
+    let mut page = String::with_capacity(512 * 1024);
+    page.push_str(HTML_HEADER);
+    page.push_str(&create_repository_requests_per_year(&years, &params)?);
+    page.push_str(&create_unique_repository_requests_per_year(
+        &years, &params, &mut json,
+    )?);
+    page.push_str(&create_repository_requests_per_month(&params)?);
+    page.push_str(&create_unique_repository_requests_per_month(
+        &params, &mut json,
+    )?);
+    page.push_str(&create_data_downloaded_per_year(&years, &params, &mut json)?);
+    page.push_str(&create_data_downloaded_per_month(&params, &mut json)?);
+    page.push_str(&create_repository_requests_per_year_and_distribution(&params)?);
+    page.push_str(&create_libdnf_requests_per_year_and_distribution(
+        &mut json, &params,
+    )?);
+    page.push_str(&create_overall_plot(&params));
+    page.push_str(&create_type_plot(&params));
+    page.push_str(&create_country_per_year_and_month(&params, &mut json)?);
+    page.push_str("</div>");
+
     let duration = start.elapsed();
     let timestamp = chrono::Utc::now().to_rfc2822();
-    file.write_all(
-        format!(
-            "<center>Generated on {timestamp}. Runtime: {duration:?}</center>"
-        )
-        .as_bytes(),
-    )?;
-    file.write_all(HTML_FOOTER.as_bytes())?;
+    page.push_str(&format!(
+        "<center>Generated on {timestamp}. Runtime: {duration:?}</center>"
+    ));
+    page.push_str(HTML_FOOTER);
 
-    let mut writer = std::io::BufWriter::new(File::create(
-        Path::new(&params.output_directory).join("stats.json"),
-    )?);
-    serde_json::to_writer(&mut writer, &json)?;
-    writer.flush()?;
+    write_atomic(
+        &Path::new(&params.output_directory).join(&params.html_output),
+        page.as_bytes(),
+    )?;
+    write_atomic(
+        &Path::new(&params.output_directory).join("stats.json"),
+        &serde_json::to_vec(&json)?,
+    )?;
 
     print_step(format!("Finished after {duration:?} at {timestamp}"));
 

@@ -28,7 +28,7 @@ jobs:
       image: docker.io/library/almalinux:9
     steps:
     - name: Install tools
-      run: dnf -y install git cargo clippy openssl-devel jq geolite2-country
+      run: dnf -y install git cargo clippy openssl-devel jq geolite2-country diffutils
     - name: Extend $PATH
       run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
     - uses: actions/checkout@v7
