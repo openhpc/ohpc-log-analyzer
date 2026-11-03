@@ -80,6 +80,9 @@ static OHPC_4: AtomicUsize = AtomicUsize::new(0);
 static STEPS: AtomicUsize = AtomicUsize::new(3);
 static CALL_COUNT: AtomicUsize = AtomicUsize::new(1);
 static CHUNK: AtomicUsize = AtomicUsize::new(0);
+/// Chunks handed to the pool but not yet merged. The reader runs ahead of
+/// the workers and this is what stops it pulling the whole file into memory.
+static CHUNKS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -792,6 +795,7 @@ fn main() {
         .unwrap()
         .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ");
     let pool = rayon::ThreadPoolBuilder::new().build().unwrap();
+    let max_in_flight = 2 * pool.current_num_threads();
 
     for input in params.access_log.clone().into_iter() {
         let pb = ProgressBar::new(0);
@@ -805,7 +809,7 @@ fn main() {
         };
         print_step(format!("Using '{input:}' as input"));
 
-        pool.scope(|scope| {
+        pool.in_place_scope(|scope| {
             let mut s = Vec::with_capacity(CHUNK_SIZE);
             loop {
                 std::io::Read::by_ref(&mut access_log)
@@ -830,12 +834,14 @@ fn main() {
                 ));
                 pb.inc(1);
 
-                loop {
-                    // Do not spawn any more threads if the queue is already full.
-                    if !pool.current_thread_has_pending_tasks().unwrap() {
-                        break;
-                    }
+                // Keep the reader from running too far ahead of the workers.
+                // in_place_scope() runs this loop on the main thread rather
+                // than on a pool worker, so waiting here cannot starve the
+                // workers of the very thread that has to drain the queue.
+                while CHUNKS_IN_FLIGHT.load(Ordering::Acquire) >= max_in_flight {
+                    std::thread::yield_now();
                 }
+                CHUNKS_IN_FLIGHT.fetch_add(1, Ordering::Release);
 
                 // Move our string into a rayon thread.
                 let data = s;
@@ -856,6 +862,7 @@ fn main() {
                         process_line(i, &mut counts);
                     }
                     merge_chunk(counts);
+                    CHUNKS_IN_FLIGHT.fetch_sub(1, Ordering::Release);
                 });
                 s = next_s;
             }
