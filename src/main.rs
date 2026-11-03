@@ -1386,6 +1386,63 @@ fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), Box<dyn std::error::
     Ok(result?)
 }
 
+/// How a chart is drawn. The HTML page uses a stacked bar chart for the
+/// overall accesses and lines everywhere else.
+#[derive(Clone, Copy, PartialEq)]
+enum ChartStyle {
+    Lines,
+    StackedBars,
+}
+
+/// A legend naming every series stops being readable long before the couple
+/// of hundred countries the country chart has, so above this many series
+/// only the largest ones are named. The others are still drawn.
+const MAX_LEGEND_ENTRIES: usize = 12;
+
+/// Colour for series `i`. The first five are the fixed palette the charts
+/// have always used, so the charts that had an SVG before keep their
+/// colours; beyond that the hue is rotated by the golden angle and the
+/// lightness cycled, which keeps dozens of series apart reasonably well.
+fn series_color(i: usize) -> RGBColor {
+    if let Some(color) = SERIES_COLORS.get(i) {
+        return *color;
+    }
+    let n = (i - SERIES_COLORS.len()) as f64;
+    let hue = (n * 137.507_764_05) % 360.0;
+    let lightness = match i % 3 {
+        0 => 0.35,
+        1 => 0.50,
+        _ => 0.65,
+    };
+    hsl_to_rgb(hue, 0.65, lightness)
+}
+
+fn hsl_to_rgb(h: f64, s: f64, l: f64) -> RGBColor {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r, g, b) = match (h / 60.0) as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    RGBColor(
+        ((r + m) * 255.0).round() as u8,
+        ((g + m) * 255.0).round() as u8,
+        ((b + m) * 255.0).round() as u8,
+    )
+}
+
+/// One chart series: a name and the points it has, each tagged with the
+/// label of the position on the x axis it belongs to. The series of a chart
+/// do not all cover the same range -- a release that only appeared in 2024
+/// has no earlier points, and most countries are missing from most months --
+/// so every point carries its own label rather than relying on position.
+type SvgSeries = (String, Vec<(String, f64)>);
+
 // A chart that cannot be rendered must not take the HTML page down with it.
 // Before this the error propagated out of create_plots, which had already
 // truncated the published index.html, so one failing SVG left the site
@@ -1393,11 +1450,11 @@ fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), Box<dyn std::error::
 fn write_svg_chart(
     path: &Path,
     title: &str,
-    x_labels: &[String],
-    series: &[(&str, Vec<f64>)],
+    series: &[SvgSeries],
     y_format: fn(f64) -> String,
+    style: ChartStyle,
 ) {
-    if let Err(e) = render_svg_chart(path, title, x_labels, series, y_format) {
+    if let Err(e) = render_svg_chart(path, title, series, y_format, style) {
         eprintln!("Rendering {} failed: {e}", path.display());
     }
 }
@@ -1405,93 +1462,260 @@ fn write_svg_chart(
 fn render_svg_chart(
     path: &Path,
     title: &str,
-    x_labels: &[String],
-    series: &[(&str, Vec<f64>)],
+    series: &[SvgSeries],
     y_format: fn(f64) -> String,
+    style: ChartStyle,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // The x axis is the sorted union of every label any series mentions.
+    // Years and zero padded year-months both sort into the right order as
+    // strings, which is the order the HTML charts use as well.
+    let mut x_labels: Vec<&str> = series
+        .iter()
+        .flat_map(|(_, points)| points.iter().map(|(label, _)| label.as_str()))
+        .collect();
+    x_labels.sort_unstable();
+    x_labels.dedup();
+
     if x_labels.is_empty() {
         return Ok(());
     }
-    let mut buf = String::new();
-    let root = SVGBackend::with_string(&mut buf, (1600, 600)).into_drawing_area();
-    root.fill(&WHITE)?;
 
-    let y_max = series
+    let index: FxHashMap<&str, usize> = x_labels
         .iter()
-        .flat_map(|(_, values)| values.iter().copied())
-        .fold(0.0_f64, f64::max);
+        .enumerate()
+        .map(|(i, label)| (*label, i))
+        .collect();
+
+    // A stacked chart is as tall as the whole stack, not as its largest
+    // single contribution.
+    let y_max = match style {
+        ChartStyle::Lines => series
+            .iter()
+            .flat_map(|(_, points)| points.iter().map(|(_, v)| *v))
+            .fold(0.0_f64, f64::max),
+        ChartStyle::StackedBars => {
+            let mut totals = vec![0.0_f64; x_labels.len()];
+            for (_, points) in series {
+                for (label, v) in points {
+                    if let Some(i) = index.get(label.as_str()) {
+                        totals[*i] += *v;
+                    }
+                }
+            }
+            totals.iter().copied().fold(0.0_f64, f64::max)
+        }
+    };
     // Leave a little headroom so the highest point is not on the frame.
     let y_max = if y_max > 0.0 { y_max * 1.05 } else { 1.0 };
-    let x_max = x_labels.len().saturating_sub(1).max(1) as i32;
 
-    let mut chart = ChartBuilder::on(&root)
-        .caption(title, ("sans-serif", 28))
-        .margin(20)
-        .x_label_area_size(60)
-        .y_label_area_size(110)
-        .build_cartesian_2d(0_i32..x_max, 0.0_f64..y_max)?;
-
-    chart
-        .configure_mesh()
-        .x_labels(x_labels.len().min(12))
-        .x_label_formatter(&|v| x_labels.get(*v as usize).cloned().unwrap_or_default())
-        .y_label_formatter(&|v| y_format(*v))
-        .draw()?;
-
-    for (i, (name, values)) in series.iter().enumerate() {
-        let color = SERIES_COLORS[i % SERIES_COLORS.len()];
-        chart
-            .draw_series(LineSeries::new(
-                values.iter().enumerate().map(|(x, y)| (x as i32, *y)),
-                color.stroke_width(2),
-            ))?
-            .label(*name)
-            .legend(move |(x, y)| {
-                PathElement::new(vec![(x, y), (x + 20, y)], color.stroke_width(2))
-            });
+    // Name every series while they still fit, otherwise only the tallest
+    // ones. Picking a subset never reorders the legend, because the entries
+    // are drawn in the order the series are added either way.
+    let mut labelled = vec![series.len() <= MAX_LEGEND_ENTRIES; series.len()];
+    if series.len() > MAX_LEGEND_ENTRIES {
+        let peak = |s: &SvgSeries| {
+            s.1.iter()
+                .map(|(_, v)| *v)
+                .fold(f64::NEG_INFINITY, f64::max)
+        };
+        let mut order: Vec<usize> = (0..series.len()).collect();
+        // The index breaks ties so the choice does not depend on the sort.
+        order.sort_by(|a, b| {
+            peak(&series[*b])
+                .partial_cmp(&peak(&series[*a]))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(b))
+        });
+        for i in order.into_iter().take(MAX_LEGEND_ENTRIES) {
+            labelled[i] = true;
+        }
     }
 
-    chart
-        .configure_series_labels()
-        .background_style(WHITE.mix(0.85))
-        .border_style(BLACK)
-        .draw()?;
+    let mut buf = String::new();
+    {
+        let root = SVGBackend::with_string(&mut buf, (1600, 600)).into_drawing_area();
+        root.fill(&WHITE)?;
 
-    root.present()?;
-    drop(root);
-    drop(chart);
+        let caption = (title, ("sans-serif", 28));
+        let label_text = |v: f64| -> String {
+            let nearest = v.round();
+            match (v - nearest).abs() > 1e-6 || nearest < 0.0 {
+                true => String::new(),
+                false => x_labels
+                    .get(nearest as usize)
+                    .map(|l| (*l).to_string())
+                    .unwrap_or_default(),
+            }
+        };
+
+        match style {
+            ChartStyle::Lines => {
+                let x_max = x_labels.len().saturating_sub(1).max(1) as i32;
+                let mut chart = ChartBuilder::on(&root)
+                    .caption(caption.0, caption.1)
+                    .margin(20)
+                    .x_label_area_size(60)
+                    .y_label_area_size(110)
+                    .build_cartesian_2d(0_i32..x_max, 0.0_f64..y_max)?;
+
+                chart
+                    .configure_mesh()
+                    .x_labels(x_labels.len().min(12))
+                    .x_label_formatter(&|v| label_text(*v as f64))
+                    .y_label_formatter(&|v| y_format(*v))
+                    .draw()?;
+
+                for (i, (name, points)) in series.iter().enumerate() {
+                    let color = series_color(i);
+                    let mut line: Vec<(i32, f64)> = points
+                        .iter()
+                        .filter_map(|(label, v)| Some((*index.get(label.as_str())? as i32, *v)))
+                        .collect();
+                    line.sort_by_key(|(x, _)| *x);
+
+                    let drawn = chart.draw_series(LineSeries::new(line, color.stroke_width(2)))?;
+                    if labelled[i] {
+                        drawn.label(name.as_str()).legend(move |(x, y)| {
+                            PathElement::new(vec![(x, y), (x + 20, y)], color.stroke_width(2))
+                        });
+                    }
+                }
+
+                chart
+                    .configure_series_labels()
+                    .background_style(WHITE.mix(0.85))
+                    .border_style(BLACK)
+                    .draw()?;
+            }
+            ChartStyle::StackedBars => {
+                let mut chart = ChartBuilder::on(&root)
+                    .caption(caption.0, caption.1)
+                    .margin(20)
+                    .x_label_area_size(60)
+                    .y_label_area_size(110)
+                    .build_cartesian_2d(-0.5_f64..(x_labels.len() as f64 - 0.5), 0.0_f64..y_max)?;
+
+                chart
+                    .configure_mesh()
+                    .x_labels(x_labels.len().min(12))
+                    .x_label_formatter(&|v| label_text(*v))
+                    .y_label_formatter(&|v| y_format(*v))
+                    .draw()?;
+
+                // Each series sits on top of the ones already drawn, which
+                // is what BarMode::Stack does in the HTML chart.
+                let mut bottoms = vec![0.0_f64; x_labels.len()];
+                for (i, (name, points)) in series.iter().enumerate() {
+                    let color = series_color(i);
+                    let mut bars = Vec::new();
+                    for (label, v) in points {
+                        let Some(slot) = index.get(label.as_str()) else {
+                            continue;
+                        };
+                        let bottom = bottoms[*slot];
+                        let top = bottom + *v;
+                        bottoms[*slot] = top;
+                        let x = *slot as f64;
+                        bars.push(Rectangle::new(
+                            [(x - 0.3, bottom), (x + 0.3, top)],
+                            color.filled(),
+                        ));
+                    }
+
+                    let drawn = chart.draw_series(bars)?;
+                    if labelled[i] {
+                        drawn.label(name.as_str()).legend(move |(x, y)| {
+                            Rectangle::new([(x, y - 5), (x + 20, y + 5)], color.filled())
+                        });
+                    }
+                }
+
+                chart
+                    .configure_series_labels()
+                    .background_style(WHITE.mix(0.85))
+                    .border_style(BLACK)
+                    .draw()?;
+            }
+        }
+
+        root.present()?;
+    }
 
     write_atomic(path, buf.as_bytes())
 }
 
-fn create_overall_plot() -> String {
+/// Build one series that has its own x range, from the labels it covers
+/// and the values belonging to them.
+fn ragged_series(name: &str, labels: &[String], values: &[i64]) -> SvgSeries {
+    (
+        name.to_string(),
+        labels
+            .iter()
+            .cloned()
+            .zip(values.iter().map(|v| *v as f64))
+            .collect(),
+    )
+}
+
+/// The labels of a chart whose x axis is a list of years.
+fn year_labels(years: &[i64]) -> Vec<String> {
+    years.iter().map(|y| y.to_string()).collect()
+}
+
+/// Build the series for a chart whose series all cover the same labels.
+fn aligned_series(labels: &[String], series: &[(&str, Vec<f64>)]) -> Vec<SvgSeries> {
+    series
+        .iter()
+        .map(|(name, values)| {
+            (
+                (*name).to_string(),
+                labels
+                    .iter()
+                    .cloned()
+                    .zip(values.iter().copied())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
+}
+
+fn create_overall_plot(params: &Args) -> String {
     let labels = vec!["Accesses"];
-    let mut plot = Plot::new();
-    plot.add_trace(
-        Bar::new(labels.clone(), vec![OHPC_1.load(Ordering::SeqCst)]).name("Release 1.3.x"),
-    );
-    plot.add_trace(
-        Bar::new(labels.clone(), vec![OHPC_2.load(Ordering::SeqCst)]).name("Release 2.x"),
-    );
-    plot.add_trace(
-        Bar::new(labels.clone(), vec![OHPC_3.load(Ordering::SeqCst)]).name("Release 3.x"),
-    );
-    plot.add_trace(
-        Bar::new(labels.clone(), vec![OHPC_4.load(Ordering::SeqCst)]).name("Release 4.x"),
-    );
-    plot.add_trace(
-        Bar::new(
-            labels,
-            vec![
-                OVERALL.load(Ordering::SeqCst)
-                    - OHPC_1.load(Ordering::SeqCst)
-                    - OHPC_2.load(Ordering::SeqCst)
-                    - OHPC_3.load(Ordering::SeqCst)
-                    - OHPC_4.load(Ordering::SeqCst),
+    let ohpc_1 = OHPC_1.load(Ordering::SeqCst);
+    let ohpc_2 = OHPC_2.load(Ordering::SeqCst);
+    let ohpc_3 = OHPC_3.load(Ordering::SeqCst);
+    let ohpc_4 = OHPC_4.load(Ordering::SeqCst);
+    let other = OVERALL
+        .load(Ordering::SeqCst)
+        .saturating_sub(ohpc_1 + ohpc_2 + ohpc_3 + ohpc_4);
+
+    if !params.no_svg {
+        // The HTML chart stacks these five bars on one category, so the SVG
+        // does the same rather than putting them side by side.
+        let accesses = |name: &str, value: usize| -> SvgSeries {
+            (name.to_string(), vec![("Accesses".to_string(), value as f64)])
+        };
+        write_svg_chart(
+            &Path::new(&params.output_directory).join("overall_accesses.svg"),
+            "OHPC overall repository accesses",
+            &[
+                accesses("Release 1.3.x", ohpc_1),
+                accesses("Release 2.x", ohpc_2),
+                accesses("Release 3.x", ohpc_3),
+                accesses("Release 4.x", ohpc_4),
+                accesses("Other", other),
             ],
-        )
-        .name("Other"),
-    );
+            format_count,
+            ChartStyle::StackedBars,
+        );
+    }
+
+    let mut plot = Plot::new();
+    plot.add_trace(Bar::new(labels.clone(), vec![ohpc_1]).name("Release 1.3.x"));
+    plot.add_trace(Bar::new(labels.clone(), vec![ohpc_2]).name("Release 2.x"));
+    plot.add_trace(Bar::new(labels.clone(), vec![ohpc_3]).name("Release 3.x"));
+    plot.add_trace(Bar::new(labels.clone(), vec![ohpc_4]).name("Release 4.x"));
+    plot.add_trace(Bar::new(labels, vec![other]).name("Other"));
     plot.set_layout(
         Layout::new()
             .bar_mode(BarMode::Stack)
@@ -1501,7 +1725,7 @@ fn create_overall_plot() -> String {
     plot.to_inline_html(None)
 }
 
-fn create_type_plot() -> String {
+fn create_type_plot(params: &Args) -> String {
     let mut years: Vec<i64> = Vec::new();
     let mut ticks: Vec<f64> = Vec::new();
     let data = TYPE_RESULTS.read().unwrap();
@@ -1523,6 +1747,23 @@ fn create_type_plot() -> String {
                 break;
             }
         }
+    }
+
+    if !params.no_svg {
+        write_svg_chart(
+            &Path::new(&params.output_directory).join("file_types_per_year.svg"),
+            "OHPC file types per year",
+            &aligned_series(
+                &year_labels(&years),
+                &[
+                    ("TAR", counts_to_f64(&tar)),
+                    ("RPM", counts_to_f64(&rpm)),
+                    ("repomd.xml", counts_to_f64(&repomd_xml)),
+                ],
+            ),
+            format_count,
+            ChartStyle::Lines,
+        );
     }
 
     let mut plot = Plot::new();
@@ -1551,6 +1792,7 @@ fn get_years(years: &mut Vec<i64>) -> Result<(), Box<dyn std::error::Error>> {
 
 fn create_repository_requests_per_year(
     years: &Vec<i64>,
+    params: &Args,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut ohpc_1: Vec<i64> = Vec::new();
     let mut ohpc_2: Vec<i64> = Vec::new();
@@ -1572,6 +1814,25 @@ fn create_repository_requests_per_year(
                 break;
             }
         }
+    }
+
+    if !params.no_svg {
+        write_svg_chart(
+            &Path::new(&params.output_directory).join("requests_per_year.svg"),
+            "OHPC repository requests per year",
+            &aligned_series(
+                &year_labels(years),
+                &[
+                    ("OHPC 1.3.x", counts_to_f64(&ohpc_1)),
+                    ("OHPC 2.x", counts_to_f64(&ohpc_2)),
+                    ("OHPC 3.x", counts_to_f64(&ohpc_3)),
+                    ("OHPC 4.x", counts_to_f64(&ohpc_4)),
+                    ("Total", counts_to_f64(&overall)),
+                ],
+            ),
+            format_count,
+            ChartStyle::Lines,
+        );
     }
 
     let mut plot = Plot::new();
@@ -1628,15 +1889,18 @@ fn create_unique_repository_requests_per_year(
         write_svg_chart(
             &Path::new(&params.output_directory).join("unique_visitors_per_year.svg"),
             "Unique OHPC repository requests per year",
-            &years.iter().map(|y| y.to_string()).collect::<Vec<_>>(),
-            &[
-                ("OHPC 1.3.x", counts_to_f64(&unique_ohpc_1)),
-                ("OHPC 2.x", counts_to_f64(&unique_ohpc_2)),
-                ("OHPC 3.x", counts_to_f64(&unique_ohpc_3)),
-                ("OHPC 4.x", counts_to_f64(&unique_ohpc_4)),
-                ("Total", counts_to_f64(&unique_overall)),
-            ],
+            &aligned_series(
+                &years.iter().map(|y| y.to_string()).collect::<Vec<_>>(),
+                &[
+                    ("OHPC 1.3.x", counts_to_f64(&unique_ohpc_1)),
+                    ("OHPC 2.x", counts_to_f64(&unique_ohpc_2)),
+                    ("OHPC 3.x", counts_to_f64(&unique_ohpc_3)),
+                    ("OHPC 4.x", counts_to_f64(&unique_ohpc_4)),
+                    ("Total", counts_to_f64(&unique_overall)),
+                ],
+            ),
             format_count,
+            ChartStyle::Lines,
         );
     }
 
@@ -1686,9 +1950,12 @@ fn create_data_downloaded_per_year(
         write_svg_chart(
             &Path::new(&params.output_directory).join("size_per_year.svg"),
             "OHPC data downloaded per year",
-            &years.iter().map(|y| y.to_string()).collect::<Vec<_>>(),
-            &[("Total", sizes_to_f64(&size))],
+            &aligned_series(
+                &years.iter().map(|y| y.to_string()).collect::<Vec<_>>(),
+                &[("Total", sizes_to_f64(&size))],
+            ),
             format_bytes,
+            ChartStyle::Lines,
         );
     }
 
@@ -1703,7 +1970,9 @@ fn create_data_downloaded_per_year(
     Ok(plot_size_per_year.to_inline_html(None))
 }
 
-fn create_repository_requests_per_month() -> Result<String, Box<dyn std::error::Error>> {
+fn create_repository_requests_per_month(
+    params: &Args,
+) -> Result<String, Box<dyn std::error::Error>> {
     let mut ohpc_1_per_month: Vec<i64> = Vec::new();
     let mut ohpc_2_per_month: Vec<i64> = Vec::new();
     let mut ohpc_3_per_month: Vec<i64> = Vec::new();
@@ -1728,6 +1997,25 @@ fn create_repository_requests_per_month() -> Result<String, Box<dyn std::error::
                 break;
             }
         }
+    }
+
+    if !params.no_svg {
+        write_svg_chart(
+            &Path::new(&params.output_directory).join("requests_per_month.svg"),
+            "OHPC repository requests per month",
+            &aligned_series(
+                &year_months,
+                &[
+                    ("OHPC 1.3.x", counts_to_f64(&ohpc_1_per_month)),
+                    ("OHPC 2.x", counts_to_f64(&ohpc_2_per_month)),
+                    ("OHPC 3.x", counts_to_f64(&ohpc_3_per_month)),
+                    ("OHPC 4.x", counts_to_f64(&ohpc_4_per_month)),
+                    ("Total", counts_to_f64(&overall_per_month)),
+                ],
+            ),
+            format_count,
+            ChartStyle::Lines,
+        );
     }
 
     let mut plot_overall_per_month = Plot::new();
@@ -1789,15 +2077,18 @@ fn create_unique_repository_requests_per_month(
         write_svg_chart(
             &Path::new(&params.output_directory).join("unique_visitors_per_month.svg"),
             "Unique OHPC repository requests per month",
-            &year_months,
-            &[
-                ("OHPC 1.3.x", counts_to_f64(&unique_ohpc_1_per_month)),
-                ("OHPC 2.x", counts_to_f64(&unique_ohpc_2_per_month)),
-                ("OHPC 3.x", counts_to_f64(&unique_ohpc_3_per_month)),
-                ("OHPC 4.x", counts_to_f64(&unique_ohpc_4_per_month)),
-                ("Total", counts_to_f64(&unique_overall_per_month)),
-            ],
+            &aligned_series(
+                &year_months,
+                &[
+                    ("OHPC 1.3.x", counts_to_f64(&unique_ohpc_1_per_month)),
+                    ("OHPC 2.x", counts_to_f64(&unique_ohpc_2_per_month)),
+                    ("OHPC 3.x", counts_to_f64(&unique_ohpc_3_per_month)),
+                    ("OHPC 4.x", counts_to_f64(&unique_ohpc_4_per_month)),
+                    ("Total", counts_to_f64(&unique_overall_per_month)),
+                ],
+            ),
             format_count,
+            ChartStyle::Lines,
         );
     }
 
@@ -1813,6 +2104,7 @@ fn create_unique_repository_requests_per_month(
 }
 
 fn create_repository_requests_per_year_and_distribution(
+    params: &Args,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut ohpc_1_sles: Vec<i64> = Vec::new();
     let mut ohpc_1_rhel: Vec<i64> = Vec::new();
@@ -1834,6 +2126,20 @@ fn create_repository_requests_per_year_and_distribution(
             }
         }
     }
+    // Each release covers its own span of years, so the series are built
+    // with the labels they actually have rather than a shared axis.
+    let mut svg: Vec<SvgSeries> = Vec::new();
+    svg.push(ragged_series(
+        "OHPC SLES 1.3.x",
+        &year_labels(&years),
+        &ohpc_1_sles,
+    ));
+    svg.push(ragged_series(
+        "OHPC RHEL 1.3.x",
+        &year_labels(&years),
+        &ohpc_1_rhel,
+    ));
+
     let mut plot = Plot::new();
     plot.add_trace(Scatter::new(years.clone(), ohpc_1_sles).name("OHPC SLES 1.3.x"));
     plot.add_trace(Scatter::new(years.clone(), ohpc_1_rhel).name("OHPC RHEL 1.3.x"));
@@ -1861,6 +2167,16 @@ fn create_repository_requests_per_year_and_distribution(
             }
         }
     }
+    svg.push(ragged_series(
+        "OHPC SLES 2.x",
+        &year_labels(&years),
+        &ohpc_2_sles,
+    ));
+    svg.push(ragged_series(
+        "OHPC RHEL 2.x",
+        &year_labels(&years),
+        &ohpc_2_rhel,
+    ));
     plot.add_trace(Scatter::new(years.clone(), ohpc_2_sles).name("OHPC SLES 2.x"));
     plot.add_trace(Scatter::new(years.clone(), ohpc_2_rhel).name("OHPC RHEL 2.x"));
 
@@ -1883,6 +2199,21 @@ fn create_repository_requests_per_year_and_distribution(
             }
         }
     }
+    svg.push(ragged_series(
+        "OHPC SLES 3.x",
+        &year_labels(&years),
+        &ohpc_3_sles,
+    ));
+    svg.push(ragged_series(
+        "OHPC RHEL 3.x",
+        &year_labels(&years),
+        &ohpc_3_rhel,
+    ));
+    svg.push(ragged_series(
+        "OHPC openEuler 3.x",
+        &year_labels(&years),
+        &ohpc_3_openeuler,
+    ));
     plot.add_trace(Scatter::new(years.clone(), ohpc_3_sles).name("OHPC SLES 3.x"));
     plot.add_trace(Scatter::new(years.clone(), ohpc_3_rhel).name("OHPC RHEL 3.x"));
     plot.add_trace(Scatter::new(years.clone(), ohpc_3_openeuler).name("OHPC openEuler 3.x"));
@@ -1904,8 +2235,29 @@ fn create_repository_requests_per_year_and_distribution(
             }
         }
     }
+    svg.push(ragged_series(
+        "OHPC RHEL 4.x",
+        &year_labels(&years),
+        &ohpc_4_rhel,
+    ));
+    svg.push(ragged_series(
+        "OHPC openEuler 4.x",
+        &year_labels(&years),
+        &ohpc_4_openeuler,
+    ));
     plot.add_trace(Scatter::new(years.clone(), ohpc_4_rhel).name("OHPC RHEL 4.x"));
     plot.add_trace(Scatter::new(years.clone(), ohpc_4_openeuler).name("OHPC openEuler 4.x"));
+
+    if !params.no_svg {
+        write_svg_chart(
+            &Path::new(&params.output_directory)
+                .join("requests_per_year_and_distribution.svg"),
+            "OHPC repository requests per year and distribution",
+            &svg,
+            format_count,
+            ChartStyle::Lines,
+        );
+    }
 
     Ok(plot.to_inline_html(None))
 }
@@ -1940,9 +2292,9 @@ fn create_data_downloaded_per_month(
         write_svg_chart(
             &Path::new(&params.output_directory).join("size_per_month.svg"),
             "OHPC data downloaded per month",
-            &year_months,
-            &[("Total", sizes_to_f64(&size_per_month))],
+            &aligned_series(&year_months, &[("Total", sizes_to_f64(&size_per_month))]),
             format_bytes,
+            ChartStyle::Lines,
         );
     }
 
@@ -2074,7 +2426,13 @@ fn create_country_per_year_and_month(
 
     let mut names: Vec<&String> = country_results.keys().collect();
     names.sort_unstable();
+    let mut svg: Vec<SvgSeries> = Vec::new();
     for result in names {
+        svg.push(ragged_series(
+            result,
+            &country_results[result].year_months,
+            &country_results[result].count,
+        ));
         let trace_countries = Scatter::new(
             country_results[result].year_months.clone(),
             country_results[result].count.clone(),
@@ -2083,11 +2441,22 @@ fn create_country_per_year_and_month(
         plot.add_trace(trace_countries);
     }
 
+    if !params.no_svg {
+        write_svg_chart(
+            &Path::new(&params.output_directory).join("country_per_month.svg"),
+            "OHPC repository country requests per month",
+            &svg,
+            format_count,
+            ChartStyle::Lines,
+        );
+    }
+
     Ok(plot.to_inline_html(None))
 }
 
 fn create_libdnf_requests_per_year_and_distribution(
     json: &mut Json,
+    params: &Args,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut ticks: Vec<f64> = Vec::new();
     let data_libdnf = LIBDNF_RESULTS.read()?;
@@ -2153,13 +2522,30 @@ fn create_libdnf_requests_per_year_and_distribution(
     // legend and the colour of every distribution changed from run to run.
     let mut names: Vec<&String> = libdnf_results.keys().collect();
     names.sort_unstable();
+    let mut svg: Vec<SvgSeries> = Vec::new();
     for result in names {
+        svg.push(ragged_series(
+            result,
+            &year_labels(&libdnf_results[result].years),
+            &libdnf_results[result].count,
+        ));
         let trace_libdnf = Scatter::new(
             libdnf_results[result].years.clone(),
             libdnf_results[result].count.clone(),
         )
         .name(result);
         plot_libdnf.add_trace(trace_libdnf);
+    }
+
+    if !params.no_svg {
+        write_svg_chart(
+            &Path::new(&params.output_directory)
+                .join("libdnf_per_year_and_distribution.svg"),
+            "OHPC repository libdnf requests per year and distribution",
+            &svg,
+            format_count,
+            ChartStyle::Lines,
+        );
     }
 
     Ok(plot_libdnf.to_inline_html(None))
@@ -2186,20 +2572,22 @@ fn create_plots(params: Args, start: Instant) -> Result<(), Box<dyn std::error::
     // truncated if any chart failed.
     let mut page = String::with_capacity(512 * 1024);
     page.push_str(HTML_HEADER);
-    page.push_str(&create_repository_requests_per_year(&years)?);
+    page.push_str(&create_repository_requests_per_year(&years, &params)?);
     page.push_str(&create_unique_repository_requests_per_year(
         &years, &params, &mut json,
     )?);
-    page.push_str(&create_repository_requests_per_month()?);
+    page.push_str(&create_repository_requests_per_month(&params)?);
     page.push_str(&create_unique_repository_requests_per_month(
         &params, &mut json,
     )?);
     page.push_str(&create_data_downloaded_per_year(&years, &params, &mut json)?);
     page.push_str(&create_data_downloaded_per_month(&params, &mut json)?);
-    page.push_str(&create_repository_requests_per_year_and_distribution()?);
-    page.push_str(&create_libdnf_requests_per_year_and_distribution(&mut json)?);
-    page.push_str(&create_overall_plot());
-    page.push_str(&create_type_plot());
+    page.push_str(&create_repository_requests_per_year_and_distribution(&params)?);
+    page.push_str(&create_libdnf_requests_per_year_and_distribution(
+        &mut json, &params,
+    )?);
+    page.push_str(&create_overall_plot(&params));
+    page.push_str(&create_type_plot(&params));
     page.push_str(&create_country_per_year_and_month(&params, &mut json)?);
     page.push_str("</div>");
 

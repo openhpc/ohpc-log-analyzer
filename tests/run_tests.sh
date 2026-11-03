@@ -99,8 +99,11 @@ SVG_DEST=$(mktemp -d)
 
 "${OHPC_LOG_ANALYZER}" --output-directory "${SVG_DEST}" tests/access_log
 
-for SVG in unique_visitors_per_year unique_visitors_per_month \
-	size_per_year size_per_month; do
+for SVG in requests_per_year unique_visitors_per_year \
+	requests_per_month unique_visitors_per_month \
+	size_per_year size_per_month \
+	requests_per_year_and_distribution libdnf_per_year_and_distribution \
+	overall_accesses file_types_per_year country_per_month; do
 	if [ ! -s "${SVG_DEST}/${SVG}.svg" ]; then
 		echo "ERROR: ${SVG}.svg was not written"
 		ls -la "${SVG_DEST}"
@@ -113,6 +116,39 @@ for SVG in unique_visitors_per_year unique_visitors_per_month \
 		exit 1
 	fi
 done
+
+# Every chart on the HTML page has to have an SVG of its own. Taking the
+# list from the page itself means a chart added later without an SVG fails
+# here rather than going unnoticed.
+SVG_COUNT=$(find "${SVG_DEST}" -name '*.svg' | wc -l)
+TITLE_COUNT=0
+while IFS= read -r TITLE; do
+	TITLE_COUNT=$((TITLE_COUNT + 1))
+	if ! grep -lF "${TITLE}" "${SVG_DEST}"/*.svg >/dev/null; then
+		echo "ERROR: no SVG carries the chart title '${TITLE}'"
+		exit 1
+	fi
+done < <(grep -o '"title":{"text":"[^"]*"' "${SVG_DEST}/index.html" |
+	sed 's/.*"text":"//; s/"$//' | sort -u)
+
+if [ "${TITLE_COUNT}" -lt 11 ]; then
+	echo "ERROR: only ${TITLE_COUNT} chart titles found in the HTML"
+	exit 1
+fi
+# A chart with no data at all writes no SVG, so there can be fewer files
+# than charts on a sparse log; more files than charts means a stray one.
+if [ "${SVG_COUNT}" -gt "${TITLE_COUNT}" ]; then
+	echo "ERROR: ${TITLE_COUNT} charts on the page but ${SVG_COUNT} SVG files"
+	ls -la "${SVG_DEST}"
+	exit 1
+fi
+
+# The overall accesses chart is stacked bars rather than lines, so it has to
+# come out as filled rectangles and not as a polyline of one point.
+if ! grep -q '<rect' "${SVG_DEST}/overall_accesses.svg"; then
+	echo "ERROR: overall_accesses.svg has no bars"
+	exit 1
+fi
 
 # A file of the right shape is not enough; the series names and the title
 # have to reach the rendered output.
