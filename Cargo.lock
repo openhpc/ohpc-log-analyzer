@@ -809,7 +809,6 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
- "time",
 ]
 
 [[package]]
