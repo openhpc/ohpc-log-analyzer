@@ -39,6 +39,7 @@ use indicatif::{
     ProgressBar,
     ProgressStyle,
 };
+use memchr::memmem::Finder;
 use plotly::layout::{
     Axis,
     BarMode,
@@ -46,11 +47,10 @@ use plotly::layout::{
 };
 use plotly::{
     Bar,
-    ImageFormat,
     Plot,
     Scatter,
 };
-use memchr::memmem::Finder;
+use plotters::prelude::*;
 use rayon::prelude::*;
 use serde::Serialize;
 
@@ -875,6 +875,101 @@ fn main() {
     }
 }
 
+/// Colours for the chart series, matching the order the traces are added.
+const SERIES_COLORS: [RGBColor; 5] = [
+    RGBColor(31, 119, 180),
+    RGBColor(255, 127, 14),
+    RGBColor(44, 160, 44),
+    RGBColor(214, 39, 40),
+    RGBColor(148, 103, 189),
+];
+
+fn counts_to_f64(values: &[i64]) -> Vec<f64> {
+    values.iter().map(|v| *v as f64).collect()
+}
+
+fn sizes_to_f64(values: &[u64]) -> Vec<f64> {
+    values.iter().map(|v| *v as f64).collect()
+}
+
+fn format_count(v: f64) -> String {
+    format!("{}", v.round() as i64)
+}
+
+fn format_bytes(v: f64) -> String {
+    const UNITS: [&str; 6] = ["B", "kB", "MB", "GB", "TB", "PB"];
+    let mut v = v;
+    let mut unit = 0;
+    while v >= 1000.0 && unit < UNITS.len() - 1 {
+        v /= 1000.0;
+        unit += 1;
+    }
+    format!("{:.1} {}", v, UNITS[unit])
+}
+
+/// Write a line chart as a standalone SVG.
+///
+/// This replaces plotly's Kaleido export, which needed an external renderer
+/// binary on the machine and was deprecated upstream. plotters renders SVG in
+/// pure Rust, so nothing outside the binary is required.
+fn write_svg_chart(
+    path: &Path,
+    title: &str,
+    x_labels: &[String],
+    series: &[(&str, Vec<f64>)],
+    y_format: fn(f64) -> String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if x_labels.is_empty() {
+        return Ok(());
+    }
+    let root = SVGBackend::new(path, (1600, 600)).into_drawing_area();
+    root.fill(&WHITE)?;
+
+    let y_max = series
+        .iter()
+        .flat_map(|(_, values)| values.iter().copied())
+        .fold(0.0_f64, f64::max);
+    // Leave a little headroom so the highest point is not on the frame.
+    let y_max = if y_max > 0.0 { y_max * 1.05 } else { 1.0 };
+    let x_max = x_labels.len().saturating_sub(1).max(1) as i32;
+
+    let mut chart = ChartBuilder::on(&root)
+        .caption(title, ("sans-serif", 28))
+        .margin(20)
+        .x_label_area_size(60)
+        .y_label_area_size(110)
+        .build_cartesian_2d(0_i32..x_max, 0.0_f64..y_max)?;
+
+    chart
+        .configure_mesh()
+        .x_labels(x_labels.len().min(12))
+        .x_label_formatter(&|v| x_labels.get(*v as usize).cloned().unwrap_or_default())
+        .y_label_formatter(&|v| y_format(*v))
+        .draw()?;
+
+    for (i, (name, values)) in series.iter().enumerate() {
+        let color = SERIES_COLORS[i % SERIES_COLORS.len()];
+        chart
+            .draw_series(LineSeries::new(
+                values.iter().enumerate().map(|(x, y)| (x as i32, *y)),
+                color.stroke_width(2),
+            ))?
+            .label(*name)
+            .legend(move |(x, y)| {
+                PathElement::new(vec![(x, y), (x + 20, y)], color.stroke_width(2))
+            });
+    }
+
+    chart
+        .configure_series_labels()
+        .background_style(WHITE.mix(0.85))
+        .border_style(BLACK)
+        .draw()?;
+
+    root.present()?;
+    Ok(())
+}
+
 fn create_overall_plot() -> String {
     let labels = vec!["Accesses"];
     let mut plot = Plot::new();
@@ -1035,6 +1130,22 @@ fn create_unique_repository_requests_per_year(
         }
     }
 
+    if !params.no_svg {
+        write_svg_chart(
+            &Path::new(&params.output_directory).join("unique_visitors_per_year.svg"),
+            "Unique OHPC repository requests per year",
+            &years.iter().map(|y| y.to_string()).collect::<Vec<_>>(),
+            &[
+                ("OHPC 1.3.x", counts_to_f64(&unique_ohpc_1)),
+                ("OHPC 2.x", counts_to_f64(&unique_ohpc_2)),
+                ("OHPC 3.x", counts_to_f64(&unique_ohpc_3)),
+                ("OHPC 4.x", counts_to_f64(&unique_ohpc_4)),
+                ("Total", counts_to_f64(&unique_overall)),
+            ],
+            format_count,
+        )?;
+    }
+
     let mut unique_plot = Plot::new();
     let trace_unique_ohpc_1 = Scatter::new(years.clone(), unique_ohpc_1).name("OHPC 1.3.x");
     let trace_unique_ohpc_2 = Scatter::new(years.clone(), unique_ohpc_2).name("OHPC 2.x");
@@ -1050,15 +1161,6 @@ fn create_unique_repository_requests_per_year(
         .title("Unique OHPC repository requests per year")
         .x_axis(Axis::new().tick_values(ticks.clone()));
     unique_plot.set_layout(unique_layout);
-    if !params.no_svg {
-        unique_plot.write_image(
-            Path::new(&params.output_directory).join("unique_visitors_per_year.svg"),
-            ImageFormat::SVG,
-            1600,
-            600,
-            1.0,
-        );
-    }
 
     Ok(unique_plot.to_inline_html(None))
 }
@@ -1086,6 +1188,16 @@ fn create_data_downloaded_per_year(
         }
     }
 
+    if !params.no_svg {
+        write_svg_chart(
+            &Path::new(&params.output_directory).join("size_per_year.svg"),
+            "OHPC data downloaded per year",
+            &years.iter().map(|y| y.to_string()).collect::<Vec<_>>(),
+            &[("Total", sizes_to_f64(&size))],
+            format_bytes,
+        )?;
+    }
+
     let mut plot_size_per_year = Plot::new();
     let size_per_year = Scatter::new(years.clone(), size).name("Total");
     plot_size_per_year.add_trace(size_per_year);
@@ -1093,16 +1205,6 @@ fn create_data_downloaded_per_year(
         .title("OHPC data downloaded per year")
         .x_axis(Axis::new().tick_values(ticks.clone()));
     plot_size_per_year.set_layout(layout_size_per_year);
-
-    if !params.no_svg {
-        plot_size_per_year.write_image(
-            Path::new(&params.output_directory).join("size_per_year.svg"),
-            ImageFormat::SVG,
-            1600,
-            600,
-            1.0,
-        );
-    }
 
     Ok(plot_size_per_year.to_inline_html(None))
 }
@@ -1189,6 +1291,22 @@ fn create_unique_repository_requests_per_month(
         }
     }
 
+    if !params.no_svg {
+        write_svg_chart(
+            &Path::new(&params.output_directory).join("unique_visitors_per_month.svg"),
+            "Unique OHPC repository requests per month",
+            &year_months,
+            &[
+                ("OHPC 1.3.x", counts_to_f64(&unique_ohpc_1_per_month)),
+                ("OHPC 2.x", counts_to_f64(&unique_ohpc_2_per_month)),
+                ("OHPC 3.x", counts_to_f64(&unique_ohpc_3_per_month)),
+                ("OHPC 4.x", counts_to_f64(&unique_ohpc_4_per_month)),
+                ("Total", counts_to_f64(&unique_overall_per_month)),
+            ],
+            format_count,
+        )?;
+    }
+
     let mut plot = Plot::new();
     plot.add_trace(Scatter::new(year_months.clone(), unique_ohpc_1_per_month).name("OHPC 1.3.x"));
     plot.add_trace(Scatter::new(year_months.clone(), unique_ohpc_2_per_month).name("OHPC 2.x"));
@@ -1196,16 +1314,6 @@ fn create_unique_repository_requests_per_month(
     plot.add_trace(Scatter::new(year_months.clone(), unique_ohpc_4_per_month).name("OHPC 4.x"));
     plot.add_trace(Scatter::new(year_months.clone(), unique_overall_per_month).name("Total"));
     plot.set_layout(Layout::new().title("Unique OHPC repository requests per month"));
-
-    if !params.no_svg {
-        plot.write_image(
-            Path::new(&params.output_directory).join("unique_visitors_per_month.svg"),
-            ImageFormat::SVG,
-            1600,
-            600,
-            1.0,
-        );
-    }
 
     Ok(plot.to_inline_html(None))
 }
@@ -1334,19 +1442,19 @@ fn create_data_downloaded_per_month(
         }
     }
 
+    if !params.no_svg {
+        write_svg_chart(
+            &Path::new(&params.output_directory).join("size_per_month.svg"),
+            "OHPC data downloaded per month",
+            &year_months,
+            &[("Total", sizes_to_f64(&size_per_month))],
+            format_bytes,
+        )?;
+    }
+
     let mut plot = Plot::new();
     plot.add_trace(Scatter::new(year_months.clone(), size_per_month).name("Total"));
     plot.set_layout(Layout::new().title("OHPC data downloaded per month"));
-
-    if !params.no_svg {
-        plot.write_image(
-            Path::new(&params.output_directory).join("size_per_month.svg"),
-            ImageFormat::SVG,
-            1600,
-            600,
-            1.0,
-        );
-    }
 
     Ok(plot.to_inline_html(None))
 }

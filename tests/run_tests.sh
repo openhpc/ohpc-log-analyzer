@@ -86,6 +86,52 @@ if [ "${OPENEULER_2025}" != "1" ]; then
 	exit 1
 fi
 
+# The --no-svg run above must not have written any SVG files.
+if ls "${DEST}"/*.svg >/dev/null 2>&1; then
+	echo "ERROR: --no-svg still wrote SVG files"
+	ls -la "${DEST}"
+	exit 1
+fi
+
+# Without --no-svg the four charts have to be written. They are rendered in
+# process, so this needs nothing installed on the machine.
+SVG_DEST=$(mktemp -d)
+
+"${OHPC_LOG_ANALYZER}" --output-directory "${SVG_DEST}" tests/access_log
+
+for SVG in unique_visitors_per_year unique_visitors_per_month \
+	size_per_year size_per_month; do
+	if [ ! -s "${SVG_DEST}/${SVG}.svg" ]; then
+		echo "ERROR: ${SVG}.svg was not written"
+		ls -la "${SVG_DEST}"
+		exit 1
+	fi
+	if ! head -n 1 "${SVG_DEST}/${SVG}.svg" |
+		grep -q '<svg width="1600" height="600"'; then
+		echo "ERROR: ${SVG}.svg is not a 1600x600 SVG"
+		head -n 1 "${SVG_DEST}/${SVG}.svg"
+		exit 1
+	fi
+done
+
+# A file of the right shape is not enough; the series names and the title
+# have to reach the rendered output.
+for NAME in "OHPC 1.3.x" "OHPC 2.x" "OHPC 3.x" "OHPC 4.x" "Total" \
+	"Unique OHPC repository requests per year"; do
+	if ! grep -qF "${NAME}" "${SVG_DEST}/unique_visitors_per_year.svg"; then
+		echo "ERROR: '${NAME}' missing from unique_visitors_per_year.svg"
+		exit 1
+	fi
+done
+
+# Byte axes are labelled in units rather than in raw digits.
+if ! grep -qE '^[0-9.]+ (B|kB|MB|GB|TB|PB)$' "${SVG_DEST}/size_per_year.svg"; then
+	echo "ERROR: size_per_year.svg has no unit-formatted axis labels"
+	exit 1
+fi
+
+rm -rf "${SVG_DEST}"
+
 jq '.' "${DEST}"/stats.json
 
 rm -rf "${DEST}"
