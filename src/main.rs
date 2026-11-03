@@ -291,8 +291,16 @@ fn count_libdnf(elements: &[String], year: i64) {
     let user_agent_long = elements[12..].join(" ");
     let user_agent_vec: Vec<_> = user_agent_long.split(';').map(|s| s.to_string()).collect();
     let mut user_agent_short = user_agent_vec[0].clone();
-    user_agent_short.truncate(user_agent_short.rfind(' ').unwrap());
-    let mut user_agent = &user_agent_short[1..];
+    // Drop the trailing version number. Without it there is no name to count.
+    match user_agent_short.rfind(' ') {
+        Some(space) => user_agent_short.truncate(space),
+        _ => return,
+    }
+    // Drop the leading '('. Indexing by byte would split a multi-byte char.
+    let mut user_agent = match user_agent_short.char_indices().nth(1) {
+        Some((i, _)) => &user_agent_short[i..],
+        _ => return,
+    };
     if user_agent.is_empty() {
         return;
     }
@@ -449,10 +457,16 @@ fn month_to_int(s: &str) -> i64 {
 }
 
 fn process_line(s: &[u8]) {
-    let line = str::from_utf8(s).unwrap();
+    // Request lines are attacker controlled and regularly contain bytes that
+    // are not valid UTF-8; those lines are skipped instead of panicking.
+    let line = match str::from_utf8(s) {
+        Ok(line) => line,
+        _ => return,
+    };
     let elements: Vec<_> = line.split(' ').map(|s| s.to_string()).collect();
     OVERALL.fetch_add(1, Ordering::SeqCst);
-    if elements.len() < 3 {
+    // elements[3] holds the timestamp, so four elements are needed.
+    if elements.len() < 4 {
         // Skip incomplete lines
         return;
     }
@@ -536,7 +550,9 @@ fn process_line(s: &[u8]) {
     if let Some(search_result) = search_ohpc {
         let substring_2 = "2/".as_bytes();
         let start = search_result + substring_ohpc.len();
-        if &s[start..start + 2] == substring_2 {
+        // A line truncated right after "/OpenHPC/" has no release digit.
+        let release = s.get(start..start + 2).unwrap_or_default();
+        if release == substring_2 {
             let leap_15 = "Leap_15".as_bytes();
             let centos_8 = "CentOS_8".as_bytes();
             let el_8 = "EL_8".as_bytes();
@@ -594,13 +610,13 @@ fn process_line(s: &[u8]) {
             }
         }
         let substring_3 = "3/".as_bytes();
-        if &s[start..start + 2] == substring_3 {
+        if release == substring_3 {
             OHPC_3.fetch_add(1, Ordering::SeqCst);
             ohpc_3 = true;
             update_distributions_ohpc_3(&s[start + 2..], year);
         }
         let substring_4 = "4/".as_bytes();
-        if &s[start..start + 2] == substring_4 {
+        if release == substring_4 {
             OHPC_4.fetch_add(1, Ordering::SeqCst);
             ohpc_4 = true;
             update_distributions_ohpc_4(&s[start + 2..], year);
