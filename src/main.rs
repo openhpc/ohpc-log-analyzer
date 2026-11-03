@@ -58,8 +58,8 @@ use serde::Serialize;
 // compiled once into SIMD-accelerated finders instead of being scanned with
 // slice::windows(), which compares byte by byte.
 static F_GET: LazyLock<Finder> = LazyLock::new(|| Finder::new(b"GET"));
-static F_PNG: LazyLock<Finder> = LazyLock::new(|| Finder::new(b"png"));
-static F_GIF: LazyLock<Finder> = LazyLock::new(|| Finder::new(b"gif"));
+static F_PNG: LazyLock<Finder> = LazyLock::new(|| Finder::new(b".png"));
+static F_GIF: LazyLock<Finder> = LazyLock::new(|| Finder::new(b".gif"));
 static F_OHPC_1_3: LazyLock<Finder> = LazyLock::new(|| Finder::new(b"/ohpc-1.3/"));
 static F_OPENHPC: LazyLock<Finder> = LazyLock::new(|| Finder::new(b"/OpenHPC/"));
 static F_SLE_12: LazyLock<Finder> = LazyLock::new(|| Finder::new(b"SLE_12"));
@@ -844,7 +844,8 @@ fn main() {
                     let mut counts = ChunkCounts::default();
 
                     for i in d_s {
-                        // Skip binary files (images) in a single pass
+                        // Skip images. The dot matters: without it this also
+                        // threw away every request for libpng-* and giflib-*.
                         if F_PNG.find(i).is_some() || F_GIF.find(i).is_some() {
                             continue;
                         }
