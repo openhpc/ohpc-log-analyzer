@@ -28,7 +28,17 @@ so a truncated or corrupt cache costs a reparse but never changes the results.
 
 The cache holds the per-address sets that the unique visitor counts are
 derived from, which makes it sizeable: around 50 MB for the full OpenHPC log
-set.
+set. Those sets are the raw client addresses, so the cache directory must
+never be inside a directory a web server publishes. Entries are written with
+mode `0600`, but that only protects them while the analyzer and the web
+server run as different users: keeping the directory out of the document
+root is what actually makes it safe.
+
+Entries are removed again once they are of no further use: when the log file
+an entry was written for no longer exists, which is what a rotated daily log
+leaves behind, and when the entry was written by a different `CACHE_VERSION`.
+An input left out of a single run keeps its entry, so a run over a subset of
+the logs does not discard the rest of the cache.
 
 `CACHE_VERSION` in `src/main.rs` has to be increased whenever a change to the
 parsing alters the counts a given log file produces. Entries written by a
