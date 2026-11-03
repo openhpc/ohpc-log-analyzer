@@ -4,7 +4,6 @@ extern crate serde;
 
 use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
-use std::collections::HashSet;
 use std::fs::File;
 use std::io::{
     Read,
@@ -105,7 +104,7 @@ struct Args {
     access_log: Vec<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct ResultOverall {
     year: i64,
     ohpc_1: i64,
@@ -119,11 +118,11 @@ struct ResultOverall {
     unique_ohpc_4: i64,
     unique_overall: i64,
     size: u64,
-    ipv4: HashSet<u32>,
-    ipv6: HashSet<u128>,
+    ipv4: FxHashMap<u32, u8>,
+    ipv6: FxHashMap<u128, u8>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct ResultOverallPerMonth {
     year: i64,
     month: i64,
@@ -138,8 +137,8 @@ struct ResultOverallPerMonth {
     unique_ohpc_4: i64,
     unique_overall: i64,
     size: u64,
-    ipv4: FxHashMap<u32, i64>,
-    ipv6: FxHashMap<u128, i64>,
+    ipv4: FxHashMap<u32, IpStats>,
+    ipv6: FxHashMap<u128, IpStats>,
 }
 
 #[derive(Debug)]
@@ -260,7 +259,256 @@ fn last_newline(s: &[u8]) -> usize {
     s.len()
 }
 
-fn count_type(elements: &[&str], year: i64) {
+/// Release membership of a single client address, one bit per OpenHPC
+/// release, so that a client counts as a unique user of every release it
+/// actually requested.
+const RELEASE_BITS: [u8; 4] = [1, 2, 4, 8];
+
+/// What one client address did within one year-month.
+#[derive(Debug, Default, Clone, Copy)]
+struct IpStats {
+    requests: i64,
+    releases: u8,
+}
+
+#[derive(Debug, Default)]
+struct YearCounts {
+    ohpc: [i64; 4],
+    overall: i64,
+    size: u64,
+    ipv4: FxHashMap<u32, u8>,
+    ipv6: FxHashMap<u128, u8>,
+}
+
+#[derive(Debug, Default)]
+struct MonthCounts {
+    ohpc: [i64; 4],
+    overall: i64,
+    size: u64,
+    ipv4: FxHashMap<u32, IpStats>,
+    ipv6: FxHashMap<u128, IpStats>,
+}
+
+/// Everything one chunk of the input learned. Each rayon task fills its own
+/// and merges it into the globals once, so the hot loop takes no locks.
+#[derive(Debug, Default)]
+struct ChunkCounts {
+    lines: usize,
+    release_lines: [usize; 4],
+    years: FxHashMap<i64, YearCounts>,
+    months: FxHashMap<(i64, i64), MonthCounts>,
+    ohpc1: FxHashMap<i64, [i64; 2]>,
+    ohpc2: FxHashMap<i64, [i64; 2]>,
+    ohpc3: FxHashMap<i64, [i64; 3]>,
+    ohpc4: FxHashMap<i64, [i64; 2]>,
+    libdnf: FxHashMap<String, FxHashMap<i64, i64>>,
+    types: FxHashMap<i64, [i64; 3]>,
+}
+
+/// Index of the entry for `year`, appending a fresh one when there is none.
+fn year_slot<T, F>(data: &mut Vec<T>, year: i64, key: fn(&T) -> i64, new: F) -> usize
+where
+    F: FnOnce() -> T,
+{
+    match data.iter().position(|r| key(r) == year) {
+        Some(i) => i,
+        _ => {
+            data.push(new());
+            data.len() - 1
+        }
+    }
+}
+
+fn merge_chunk(counts: ChunkCounts) {
+    OVERALL.fetch_add(counts.lines, Ordering::Relaxed);
+    OHPC_1.fetch_add(counts.release_lines[0], Ordering::Relaxed);
+    OHPC_2.fetch_add(counts.release_lines[1], Ordering::Relaxed);
+    OHPC_3.fetch_add(counts.release_lines[2], Ordering::Relaxed);
+    OHPC_4.fetch_add(counts.release_lines[3], Ordering::Relaxed);
+
+    {
+        let mut data = OVERALL_RESULTS.write().unwrap();
+        for (year, y) in counts.years {
+            let i = year_slot(&mut data, year, |r| r.year, || ResultOverall {
+                year,
+                ..Default::default()
+            });
+            let entry = &mut data[i];
+            entry.overall += y.overall;
+            entry.size += y.size;
+            entry.ohpc_1 += y.ohpc[0];
+            entry.ohpc_2 += y.ohpc[1];
+            entry.ohpc_3 += y.ohpc[2];
+            entry.ohpc_4 += y.ohpc[3];
+            for (ip, releases) in y.ipv4 {
+                *entry.ipv4.entry(ip).or_insert(0) |= releases;
+            }
+            for (ip, releases) in y.ipv6 {
+                *entry.ipv6.entry(ip).or_insert(0) |= releases;
+            }
+        }
+    }
+
+    {
+        let mut data = OVERALL_RESULTS_PER_MONTH.write().unwrap();
+        for ((year, month), m) in counts.months {
+            let i = match data.iter().position(|r| r.year == year && r.month == month) {
+                Some(i) => i,
+                _ => {
+                    data.push(ResultOverallPerMonth {
+                        year,
+                        month,
+                        ..Default::default()
+                    });
+                    data.len() - 1
+                }
+            };
+            let entry = &mut data[i];
+            entry.overall += m.overall;
+            entry.size += m.size;
+            entry.ohpc_1 += m.ohpc[0];
+            entry.ohpc_2 += m.ohpc[1];
+            entry.ohpc_3 += m.ohpc[2];
+            entry.ohpc_4 += m.ohpc[3];
+            for (ip, stats) in m.ipv4 {
+                let slot = entry.ipv4.entry(ip).or_default();
+                slot.requests += stats.requests;
+                slot.releases |= stats.releases;
+            }
+            for (ip, stats) in m.ipv6 {
+                let slot = entry.ipv6.entry(ip).or_default();
+                slot.requests += stats.requests;
+                slot.releases |= stats.releases;
+            }
+        }
+    }
+
+    {
+        let mut data = OHPC1_RESULTS.write().unwrap();
+        for (year, c) in counts.ohpc1 {
+            let i = year_slot(&mut data, year, |r| r.year, || ResultOHPC1 {
+                year,
+                sles: 0,
+                rhel: 0,
+            });
+            data[i].sles += c[0];
+            data[i].rhel += c[1];
+        }
+    }
+    {
+        let mut data = OHPC2_RESULTS.write().unwrap();
+        for (year, c) in counts.ohpc2 {
+            let i = year_slot(&mut data, year, |r| r.year, || ResultOHPC2 {
+                year,
+                sles: 0,
+                rhel: 0,
+            });
+            data[i].sles += c[0];
+            data[i].rhel += c[1];
+        }
+    }
+    {
+        let mut data = OHPC3_RESULTS.write().unwrap();
+        for (year, c) in counts.ohpc3 {
+            let i = year_slot(&mut data, year, |r| r.year, || ResultOHPC3 {
+                year,
+                sles: 0,
+                rhel: 0,
+                openeuler: 0,
+            });
+            data[i].sles += c[0];
+            data[i].rhel += c[1];
+            data[i].openeuler += c[2];
+        }
+    }
+    {
+        let mut data = OHPC4_RESULTS.write().unwrap();
+        for (year, c) in counts.ohpc4 {
+            let i = year_slot(&mut data, year, |r| r.year, || ResultOHPC4 {
+                year,
+                rhel: 0,
+                openeuler: 0,
+            });
+            data[i].rhel += c[0];
+            data[i].openeuler += c[1];
+        }
+    }
+    {
+        let mut data = TYPE_RESULTS.write().unwrap();
+        for (year, c) in counts.types {
+            let i = year_slot(&mut data, year, |r| r.year, || ResultType {
+                year,
+                tar: 0,
+                rpm: 0,
+                repomd_xml: 0,
+            });
+            data[i].tar += c[0];
+            data[i].rpm += c[1];
+            data[i].repomd_xml += c[2];
+        }
+    }
+    {
+        let mut data = LIBDNF_RESULTS.write().unwrap();
+        for (name, per_year) in counts.libdnf {
+            for (year, count) in per_year {
+                match data
+                    .iter_mut()
+                    .find(|r| r.year == year && r.name == name)
+                {
+                    Some(r) => r.count += count,
+                    _ => data.push(ResultLIBDNF {
+                        year,
+                        name: name.clone(),
+                        count,
+                    }),
+                }
+            }
+        }
+    }
+}
+
+/// Unique visitor counts are derived once, after all chunks are merged, so
+/// they do not depend on the order the chunks happened to finish in.
+fn finalize_unique_counts() -> Result<(), Box<dyn std::error::Error>> {
+    let mut data = OVERALL_RESULTS.write()?;
+    for result in data.iter_mut() {
+        let mut unique = [0i64; 4];
+        for releases in result.ipv4.values().chain(result.ipv6.values()) {
+            for (i, bit) in RELEASE_BITS.iter().enumerate() {
+                if releases & bit != 0 {
+                    unique[i] += 1;
+                }
+            }
+        }
+        result.unique_overall = (result.ipv4.len() + result.ipv6.len()) as i64;
+        result.unique_ohpc_1 = unique[0];
+        result.unique_ohpc_2 = unique[1];
+        result.unique_ohpc_3 = unique[2];
+        result.unique_ohpc_4 = unique[3];
+    }
+    drop(data);
+
+    let mut data = OVERALL_RESULTS_PER_MONTH.write()?;
+    for result in data.iter_mut() {
+        let mut unique = [0i64; 4];
+        for stats in result.ipv4.values().chain(result.ipv6.values()) {
+            for (i, bit) in RELEASE_BITS.iter().enumerate() {
+                if stats.releases & bit != 0 {
+                    unique[i] += 1;
+                }
+            }
+        }
+        result.unique_overall = (result.ipv4.len() + result.ipv6.len()) as i64;
+        result.unique_ohpc_1 = unique[0];
+        result.unique_ohpc_2 = unique[1];
+        result.unique_ohpc_3 = unique[2];
+        result.unique_ohpc_4 = unique[3];
+    }
+
+    Ok(())
+}
+
+fn count_type(elements: &[&str], year: i64, counts: &mut ChunkCounts) {
     if elements.len() < 7 {
         return;
     }
@@ -270,35 +518,19 @@ fn count_type(elements: &[&str], year: i64) {
     if !tar_found && !rpm_found && !repomd_xml_found {
         return;
     }
-    let mut data = TYPE_RESULTS.write().unwrap();
-    let mut entry_found = false;
-    for result in data.as_mut_slice() {
-        if result.year == year {
-            entry_found = true;
-            if rpm_found {
-                result.rpm += 1;
-            }
-            if tar_found {
-                result.tar += 1;
-            }
-            if repomd_xml_found {
-                result.repomd_xml += 1;
-            }
-            break;
-        }
+    let entry = counts.types.entry(year).or_default();
+    if tar_found {
+        entry[0] += 1;
     }
-
-    if !entry_found {
-        data.push(ResultType {
-            year,
-            tar: tar_found.into(),
-            rpm: rpm_found.into(),
-            repomd_xml: repomd_xml_found.into(),
-        });
+    if rpm_found {
+        entry[1] += 1;
+    }
+    if repomd_xml_found {
+        entry[2] += 1;
     }
 }
 
-fn count_libdnf(elements: &[&str], year: i64) {
+fn count_libdnf(elements: &[&str], year: i64, counts: &mut ChunkCounts) {
     if elements.len() < 12 {
         return;
     }
@@ -347,21 +579,18 @@ fn count_libdnf(elements: &[&str], year: i64) {
         other => other,
     };
 
-    let mut data = LIBDNF_RESULTS.write().unwrap();
-    for result in data.as_mut_slice() {
-        if result.year == year && result.name == user_agent {
-            result.count += 1;
-            return;
+    // Only a distribution seen for the first time needs its name allocated.
+    match counts.libdnf.get_mut(user_agent) {
+        Some(per_year) => *per_year.entry(year).or_insert(0) += 1,
+        _ => {
+            counts
+                .libdnf
+                .insert(user_agent.to_string(), FxHashMap::from_iter([(year, 1)]));
         }
     }
-    data.push(ResultLIBDNF {
-        year,
-        name: user_agent.to_string(),
-        count: 1,
-    });
 }
 
-fn update_distributions_ohpc_3(s: &[u8], year: i64) {
+fn update_distributions_ohpc_3(s: &[u8], year: i64, counts: &mut ChunkCounts) {
     let mut leap_15_found = false;
     let mut el_9_found = false;
     let mut openeuler_found = false;
@@ -375,39 +604,19 @@ fn update_distributions_ohpc_3(s: &[u8], year: i64) {
     if !el_9_found && !leap_15_found && !openeuler_found {
         return;
     }
-    let mut data = OHPC3_RESULTS.write().unwrap();
-    let mut year_found = false;
-    for result in &*data {
-        if result.year == year {
-            year_found = true;
-            break;
-        }
+    let entry = counts.ohpc3.entry(year).or_default();
+    if leap_15_found {
+        entry[0] += 1;
     }
-    if !year_found {
-        data.push(ResultOHPC3 {
-            year,
-            sles: 0,
-            rhel: 0,
-            openeuler: 0,
-        });
+    if el_9_found {
+        entry[1] += 1;
     }
-    for result in data.as_mut_slice() {
-        if result.year == year {
-            if el_9_found {
-                result.rhel += 1;
-            }
-            if leap_15_found {
-                result.sles += 1;
-            }
-            if openeuler_found {
-                result.openeuler += 1;
-            }
-            break;
-        }
+    if openeuler_found {
+        entry[2] += 1;
     }
 }
 
-fn update_distributions_ohpc_4(s: &[u8], year: i64) {
+fn update_distributions_ohpc_4(s: &[u8], year: i64, counts: &mut ChunkCounts) {
     let mut el_10_found = false;
     let mut openeuler_found = false;
     if F_EL_10.find(s).is_some() {
@@ -418,31 +627,12 @@ fn update_distributions_ohpc_4(s: &[u8], year: i64) {
     if !el_10_found && !openeuler_found {
         return;
     }
-    let mut data = OHPC4_RESULTS.write().unwrap();
-    let mut year_found = false;
-    for result in &*data {
-        if result.year == year {
-            year_found = true;
-            break;
-        }
+    let entry = counts.ohpc4.entry(year).or_default();
+    if el_10_found {
+        entry[0] += 1;
     }
-    if !year_found {
-        data.push(ResultOHPC4 {
-            year,
-            rhel: 0,
-            openeuler: 0,
-        });
-    }
-    for result in data.as_mut_slice() {
-        if result.year == year {
-            if el_10_found {
-                result.rhel += 1;
-            }
-            if openeuler_found {
-                result.openeuler += 1;
-            }
-            break;
-        }
+    if openeuler_found {
+        entry[1] += 1;
     }
 }
 
@@ -464,7 +654,7 @@ fn month_to_int(s: &str) -> i64 {
     }
 }
 
-fn process_line(s: &[u8]) {
+fn process_line(s: &[u8], counts: &mut ChunkCounts) {
     // Request lines are attacker controlled and regularly contain bytes that
     // are not valid UTF-8; those lines are skipped instead of panicking.
     let line = match str::from_utf8(s) {
@@ -472,7 +662,7 @@ fn process_line(s: &[u8]) {
         _ => return,
     };
     let elements: Vec<&str> = line.split(' ').collect();
-    OVERALL.fetch_add(1, Ordering::Relaxed);
+    counts.lines += 1;
     // elements[3] holds the timestamp, so four elements are needed.
     if elements.len() < 4 {
         // Skip incomplete lines
@@ -491,110 +681,46 @@ fn process_line(s: &[u8]) {
         return;
     }
 
-    count_libdnf(&elements, year);
-    count_type(&elements, year);
-    let mut ohpc_1 = false;
-    let mut ohpc_2 = false;
-    let mut ohpc_3 = false;
-    let mut ohpc_4 = false;
-    if let Some(search_result) = F_OHPC_1_3.find(s) {
-        OHPC_1.fetch_add(1, Ordering::Relaxed);
-        ohpc_1 = true;
-        let start = search_result + "/ohpc-1.3/".len();
-        let rest = &s[start..];
-        let mut centos_7_found = false;
-        let mut sle_12_found = false;
-        if F_CENTOS_7.find(rest).is_some() {
-            centos_7_found = true;
-        } else if F_SLE_12.find(rest).is_some() {
-            sle_12_found = true;
-        }
+    count_libdnf(&elements, year, counts);
+    count_type(&elements, year, counts);
 
-        let mut data = OHPC1_RESULTS.write().unwrap();
-        let mut year_found = false;
-        for result in &*data {
-            if result.year == year {
-                year_found = true;
-                break;
-            }
-        }
-        if !year_found {
-            data.push(ResultOHPC1 {
-                year,
-                sles: 0,
-                rhel: 0,
-            });
-        }
-        for result in data.as_mut_slice() {
-            if result.year == year {
-                if centos_7_found {
-                    result.rhel += 1;
-                }
-                if sle_12_found {
-                    result.sles += 1;
-                }
-                break;
-            }
+    let mut releases = 0u8;
+    if let Some(search_result) = F_OHPC_1_3.find(s) {
+        counts.release_lines[0] += 1;
+        releases |= RELEASE_BITS[0];
+        let rest = &s[search_result + "/ohpc-1.3/".len()..];
+        let entry = counts.ohpc1.entry(year).or_default();
+        if F_CENTOS_7.find(rest).is_some() {
+            entry[1] += 1;
+        } else if F_SLE_12.find(rest).is_some() {
+            entry[0] += 1;
         }
     }
-    let search_ohpc = F_OPENHPC.find(s);
 
-    if let Some(search_result) = search_ohpc {
-        let substring_2 = "2/".as_bytes();
+    if let Some(search_result) = F_OPENHPC.find(s) {
         let start = search_result + "/OpenHPC/".len();
         // A line truncated right after "/OpenHPC/" has no release digit.
         let release = s.get(start..start + 2).unwrap_or_default();
-        if release == substring_2 {
-            let mut leap_15_found = false;
-            let mut el_8_found = false;
-            OHPC_2.fetch_add(1, Ordering::Relaxed);
-            ohpc_2 = true;
+        if release == "2/".as_bytes() {
+            counts.release_lines[1] += 1;
+            releases |= RELEASE_BITS[1];
             let rest = &s[start + 2..];
+            let entry = counts.ohpc2.entry(year).or_default();
             if F_LEAP_15.find(rest).is_some() {
-                leap_15_found = true;
+                entry[0] += 1;
             } else if F_CENTOS_8.find(rest).is_some() || F_EL_8.find(rest).is_some() {
-                el_8_found = true;
-            }
-            {
-                let mut data = OHPC2_RESULTS.write().unwrap();
-                let mut year_found = false;
-                for result in &*data {
-                    if result.year == year {
-                        year_found = true;
-                        break;
-                    }
-                }
-                if !year_found {
-                    data.push(ResultOHPC2 {
-                        year,
-                        sles: 0,
-                        rhel: 0,
-                    });
-                }
-                for result in data.as_mut_slice() {
-                    if result.year == year {
-                        if el_8_found {
-                            result.rhel += 1;
-                        }
-                        if leap_15_found {
-                            result.sles += 1;
-                        }
-                        break;
-                    }
-                }
+                entry[1] += 1;
             }
         }
-        let substring_3 = "3/".as_bytes();
-        if release == substring_3 {
-            OHPC_3.fetch_add(1, Ordering::Relaxed);
-            ohpc_3 = true;
-            update_distributions_ohpc_3(&s[start + 2..], year);
+        if release == "3/".as_bytes() {
+            counts.release_lines[2] += 1;
+            releases |= RELEASE_BITS[2];
+            update_distributions_ohpc_3(&s[start + 2..], year, counts);
         }
-        let substring_4 = "4/".as_bytes();
-        if release == substring_4 {
-            OHPC_4.fetch_add(1, Ordering::Relaxed);
-            ohpc_4 = true;
-            update_distributions_ohpc_4(&s[start + 2..], year);
+        if release == "4/".as_bytes() {
+            counts.release_lines[3] += 1;
+            releases |= RELEASE_BITS[3];
+            update_distributions_ohpc_4(&s[start + 2..], year, counts);
         }
     }
 
@@ -608,184 +734,33 @@ fn process_line(s: &[u8]) {
         _ => IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
     };
 
-    {
-        let mut data = OVERALL_RESULTS.write().unwrap();
-        let mut year_found = false;
-        for result in &*data {
-            if result.year == year {
-                year_found = true;
-                break;
-            }
-        }
-        if !year_found {
-            data.push(ResultOverall {
-                year,
-                ohpc_1: ohpc_1 as i64,
-                ohpc_2: ohpc_2 as i64,
-                ohpc_3: ohpc_3 as i64,
-                ohpc_4: ohpc_4 as i64,
-                overall: 1,
-                unique_ohpc_1: ohpc_1 as i64,
-                unique_ohpc_2: ohpc_2 as i64,
-                unique_ohpc_3: ohpc_3 as i64,
-                unique_ohpc_4: ohpc_4 as i64,
-                unique_overall: 1,
-                size,
-                ipv4: match &ip {
-                    IpAddr::V4(ipv4) => vec![(*ipv4).into()].into_iter().collect(),
-                    _ => vec![0].into_iter().collect(),
-                },
-                ipv6: match ip {
-                    IpAddr::V6(ipv6) => vec![ipv6.into()].into_iter().collect(),
-                    _ => vec![0].into_iter().collect(),
-                },
-            });
-        } else {
-            for result in data.as_mut_slice() {
-                if result.year == year {
-                    result.overall += 1;
-                    result.size += size;
-                    if ohpc_1 {
-                        result.ohpc_1 += 1;
-                    }
-                    if ohpc_2 {
-                        result.ohpc_2 += 1;
-                    }
-                    if ohpc_3 {
-                        result.ohpc_3 += 1;
-                    }
-                    if ohpc_4 {
-                        result.ohpc_4 += 1;
-                    }
-                    let mut unique = false;
-                    match ip {
-                        IpAddr::V4(ipv4) => {
-                            if !result.ipv4.contains(&ipv4.into()) {
-                                result.ipv4.insert(ipv4.into());
-                                unique = true;
-                            }
-                        }
-                        IpAddr::V6(ipv6) => {
-                            if !result.ipv6.contains(&ipv6.into()) {
-                                result.ipv6.insert(ipv6.into());
-                                unique = true;
-                            }
-                        }
-                    }
-                    if unique {
-                        result.unique_overall += 1;
-                        if ohpc_1 {
-                            result.unique_ohpc_1 += 1;
-                        }
-                        if ohpc_2 {
-                            result.unique_ohpc_2 += 1;
-                        }
-                        if ohpc_3 {
-                            result.unique_ohpc_3 += 1;
-                        }
-                        if ohpc_4 {
-                            result.unique_ohpc_4 += 1;
-                        }
-                    }
-                    break;
-                }
-            }
+    let year_counts = counts.years.entry(year).or_default();
+    year_counts.overall += 1;
+    year_counts.size += size;
+    for (i, bit) in RELEASE_BITS.iter().enumerate() {
+        if releases & bit != 0 {
+            year_counts.ohpc[i] += 1;
         }
     }
-    {
-        let mut data_year_month = OVERALL_RESULTS_PER_MONTH.write().unwrap();
-        let mut year_month_found = false;
+    match ip {
+        IpAddr::V4(ipv4) => *year_counts.ipv4.entry(ipv4.into()).or_insert(0) |= releases,
+        IpAddr::V6(ipv6) => *year_counts.ipv6.entry(ipv6.into()).or_insert(0) |= releases,
+    }
 
-        for result in &*data_year_month {
-            if result.year == year && result.month == month {
-                year_month_found = true;
-                break;
-            }
-        }
-        if !year_month_found {
-            data_year_month.push(ResultOverallPerMonth {
-                year,
-                month,
-                ohpc_1: ohpc_1 as i64,
-                ohpc_2: ohpc_2 as i64,
-                ohpc_3: ohpc_3 as i64,
-                ohpc_4: ohpc_4 as i64,
-                overall: 1,
-                unique_ohpc_1: ohpc_1 as i64,
-                unique_ohpc_2: ohpc_2 as i64,
-                unique_ohpc_3: ohpc_3 as i64,
-                unique_ohpc_4: ohpc_4 as i64,
-                unique_overall: 1,
-                size,
-                ipv4: match &ip {
-                    IpAddr::V4(ipv4) => FxHashMap::from_iter([((*ipv4).into(), 1)]),
-                    _ => FxHashMap::from_iter([(0, 0)]),
-                },
-                ipv6: match ip {
-                    IpAddr::V6(ipv6) => FxHashMap::from_iter([(ipv6.into(), 1)]),
-                    _ => FxHashMap::from_iter([(0, 0)]),
-                },
-            })
-        } else {
-            for result in data_year_month.as_mut_slice() {
-                if result.year == year && result.month == month {
-                    result.overall += 1;
-                    result.size += size;
-                    if ohpc_1 {
-                        result.ohpc_1 += 1;
-                    }
-                    if ohpc_2 {
-                        result.ohpc_2 += 1;
-                    }
-                    if ohpc_3 {
-                        result.ohpc_3 += 1;
-                    }
-                    if ohpc_4 {
-                        result.ohpc_4 += 1;
-                    }
-                    let mut unique = false;
-                    match ip {
-                        IpAddr::V4(ipv4) => {
-                            if let std::collections::hash_map::Entry::Vacant(e) =
-                                result.ipv4.entry(ipv4.into())
-                            {
-                                e.insert(1);
-                                unique = true;
-                            } else {
-                                *result.ipv4.get_mut(&ipv4.into()).unwrap() += 1;
-                            }
-                        }
-                        IpAddr::V6(ipv6) => {
-                            if let std::collections::hash_map::Entry::Vacant(e) =
-                                result.ipv6.entry(ipv6.into())
-                            {
-                                e.insert(1);
-                                unique = true;
-                            } else {
-                                *result.ipv6.get_mut(&ipv6.into()).unwrap() += 1;
-                            }
-                        }
-                    }
-                    if unique {
-                        result.unique_overall += 1;
-                        if ohpc_1 {
-                            result.unique_ohpc_1 += 1;
-                        }
-                        if ohpc_2 {
-                            result.unique_ohpc_2 += 1;
-                        }
-                        if ohpc_3 {
-                            result.unique_ohpc_3 += 1;
-                        }
-                        if ohpc_4 {
-                            result.unique_ohpc_4 += 1;
-                        }
-                    }
-                    break;
-                }
-            }
+    let month_counts = counts.months.entry((year, month)).or_default();
+    month_counts.overall += 1;
+    month_counts.size += size;
+    for (i, bit) in RELEASE_BITS.iter().enumerate() {
+        if releases & bit != 0 {
+            month_counts.ohpc[i] += 1;
         }
     }
+    let stats = match ip {
+        IpAddr::V4(ipv4) => month_counts.ipv4.entry(ipv4.into()).or_default(),
+        IpAddr::V6(ipv6) => month_counts.ipv6.entry(ipv6.into()).or_default(),
+    };
+    stats.requests += 1;
+    stats.releases |= releases;
 }
 
 pub fn print_step(msg: String) {
@@ -866,6 +841,7 @@ fn main() {
                 let data = s;
                 scope.spawn(move |_| {
                     let d_s = data[..last_newline].split(|c| *c == b'\n');
+                    let mut counts = ChunkCounts::default();
 
                     for i in d_s {
                         // Skip binary files (images) in a single pass
@@ -876,8 +852,9 @@ fn main() {
                             // Skip broken lines with two or more "GET"s
                             continue;
                         }
-                        process_line(i);
+                        process_line(i, &mut counts);
                     }
+                    merge_chunk(counts);
                 });
                 s = next_s;
             }
@@ -1412,18 +1389,18 @@ fn fill_country_results(params: &Args) -> Result<(), Box<dyn std::error::Error>>
         let v4 = result
             .ipv4
             .par_iter()
-            .fold(FxHashMap::default, |mut acc, (key, value)| {
+            .fold(FxHashMap::default, |mut acc, (key, stats)| {
                 let c = lookup(&geoip_reader, IpAddr::V4(Ipv4Addr::from(*key)));
-                *acc.entry(c).or_insert(0) += *value;
+                *acc.entry(c).or_insert(0) += stats.requests;
                 acc
             })
             .reduce(FxHashMap::default, merge);
         let v6 = result
             .ipv6
             .par_iter()
-            .fold(FxHashMap::default, |mut acc, (key, value)| {
+            .fold(FxHashMap::default, |mut acc, (key, stats)| {
                 let c = lookup(&geoip_reader, IpAddr::V6(Ipv6Addr::from(*key)));
-                *acc.entry(c).or_insert(0) += *value;
+                *acc.entry(c).or_insert(0) += stats.requests;
                 acc
             })
             .reduce(FxHashMap::default, merge);
@@ -1575,6 +1552,8 @@ fn create_libdnf_requests_per_year_and_distribution(
 }
 
 fn create_plots(params: Args, start: Instant) -> Result<(), Box<dyn std::error::Error>> {
+    finalize_unique_counts()?;
+
     let mut years: Vec<i64> = Vec::new();
     get_years(&mut years)?;
 
