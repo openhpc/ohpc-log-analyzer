@@ -912,7 +912,23 @@ fn format_bytes(v: f64) -> String {
 /// This replaces plotly's Kaleido export, which needed an external renderer
 /// binary on the machine and was deprecated upstream. plotters renders SVG in
 /// pure Rust, so nothing outside the binary is required.
+// A chart that cannot be rendered must not take the HTML page down with it.
+// Before this the error propagated out of create_plots, which had already
+// truncated the published index.html, so one failing SVG left the site
+// showing nothing but the charts written before it.
 fn write_svg_chart(
+    path: &Path,
+    title: &str,
+    x_labels: &[String],
+    series: &[(&str, Vec<f64>)],
+    y_format: fn(f64) -> String,
+) {
+    if let Err(e) = render_svg_chart(path, title, x_labels, series, y_format) {
+        eprintln!("Rendering {} failed: {e}", path.display());
+    }
+}
+
+fn render_svg_chart(
     path: &Path,
     title: &str,
     x_labels: &[String],
@@ -1143,7 +1159,7 @@ fn create_unique_repository_requests_per_year(
                 ("Total", counts_to_f64(&unique_overall)),
             ],
             format_count,
-        )?;
+        );
     }
 
     let mut unique_plot = Plot::new();
@@ -1195,7 +1211,7 @@ fn create_data_downloaded_per_year(
             &years.iter().map(|y| y.to_string()).collect::<Vec<_>>(),
             &[("Total", sizes_to_f64(&size))],
             format_bytes,
-        )?;
+        );
     }
 
     let mut plot_size_per_year = Plot::new();
@@ -1304,7 +1320,7 @@ fn create_unique_repository_requests_per_month(
                 ("Total", counts_to_f64(&unique_overall_per_month)),
             ],
             format_count,
-        )?;
+        );
     }
 
     let mut plot = Plot::new();
@@ -1449,7 +1465,7 @@ fn create_data_downloaded_per_month(
             &year_months,
             &[("Total", sizes_to_f64(&size_per_month))],
             format_bytes,
-        )?;
+        );
     }
 
     let mut plot = Plot::new();
