@@ -254,6 +254,24 @@ if ! diff -q "${PLAIN_GROWN}/stats.json" "${CORRUPT}/stats.json"; then
 	exit 1
 fi
 
+# A cache entry holds the client addresses the unique visitor counts come
+# from, so it must not be readable by anyone but the user running the
+# analyzer. A published file has to stay readable, or the web server cannot
+# serve it, so the two must not have come out with the same mode.
+for ENTRY in "${CACHE_DIR}"/*.counts; do
+	MODE=$(stat -c '%a' "${ENTRY}")
+	if [ "${MODE}" != "600" ]; then
+		echo "ERROR: cache entry ${ENTRY} has mode ${MODE}, expected 600"
+		exit 1
+	fi
+done
+
+PAGE_MODE=$(stat -c '%a' "${COLD}/index.html")
+if [ "${PAGE_MODE}" = "600" ]; then
+	echo "ERROR: the published index.html is not readable (mode ${PAGE_MODE})"
+	exit 1
+fi
+
 rm -rf "${CACHE_DIR}" "${CACHE_LOG}" "${COLD}" "${WARM}" "${GROWN}" \
 	"${PLAIN_GROWN}" "${CORRUPT}"
 

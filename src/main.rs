@@ -4,7 +4,8 @@ extern crate serde;
 
 use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
-use std::fs::{self, File};
+use std::fs;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::io::{
     Read,
     Write,
@@ -727,7 +728,7 @@ fn write_cache(
     e.u64(id.inode);
     e.0.extend_from_slice(&encode_counts(counts));
 
-    write_atomic(&cache_path(cache_dir, input), &e.0)
+    write_private(&cache_path(cache_dir, input), &e.0)
 }
 
 fn merge_chunk(counts: ChunkCounts) {
@@ -1362,6 +1363,25 @@ fn format_bytes(v: f64) -> String {
 // reader sees either the previous file or the complete new one, and a failed
 // run leaves the previous file untouched.
 fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    write_file(path, contents, None)
+}
+
+/// Writes `contents` at `path` as [`write_atomic`] does, but readable only by
+/// the user running the analyzer.
+///
+/// A cache entry holds the raw client addresses the unique visitor counts are
+/// derived from. The default permissions of a new file make those readable by
+/// anything that can reach the directory, which publishes them outright when
+/// the cache was pointed at a directory a web server serves.
+fn write_private(path: &Path, contents: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    write_file(path, contents, Some(0o600))
+}
+
+fn write_file(
+    path: &Path,
+    contents: &[u8],
+    mode: Option<u32>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // The process id keeps two runs writing the same destination from
     // interleaving into one temporary file and renaming the result into
     // place, which would publish exactly the corrupt file this avoids.
@@ -1370,7 +1390,19 @@ fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), Box<dyn std::error::
     let tmp = PathBuf::from(tmp);
 
     let result = (|| -> std::io::Result<()> {
-        let mut file = File::create(&tmp)?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        if let Some(mode) = mode {
+            options.mode(mode);
+        }
+        let mut file = options.open(&tmp)?;
+        if let Some(mode) = mode {
+            // The mode above applies only when the open creates the file, so
+            // a temporary left behind by a crashed run of the same pid would
+            // keep whatever permissions it already had. Setting them again
+            // covers that, before anything is written into the file.
+            file.set_permissions(fs::Permissions::from_mode(mode))?;
+        }
         file.write_all(contents)?;
         // Rename only orders the directory entry against the file contents if
         // those contents have reached the disk, so flush before renaming.
