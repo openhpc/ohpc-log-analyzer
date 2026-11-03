@@ -22,6 +22,7 @@ use std::sync::atomic::{
 use std::sync::{
     Arc,
     LazyLock,
+    Mutex,
     RwLock,
 };
 use std::time::Instant;
@@ -102,6 +103,12 @@ struct Args {
     /// GeoIP mmdb database
     #[arg(long, default_value = "/usr/share/GeoIP/GeoLite2-Country.mmdb")]
     geoip: String,
+
+    /// Directory holding the per input file counter cache. When it is set,
+    /// the counts for each input file are stored there and reused for as
+    /// long as that file is unchanged, so a rotated log is parsed only once.
+    #[arg(long)]
+    cache_directory: Option<String>,
 
     /// One or multiple access logs
     access_log: Vec<String>,
@@ -320,6 +327,407 @@ where
             data.len() - 1
         }
     }
+}
+
+// Everything a chunk contributes is already collected in ChunkCounts, and
+// merging two of them is associative, so a whole input file can be folded
+// into a single ChunkCounts and kept on disk. A log file that has been
+// rotated never changes again, which means the 33 GB of historical logs are
+// parsed once and only read back as counters afterwards.
+fn merge_counts(dst: &mut ChunkCounts, src: ChunkCounts) {
+    dst.lines += src.lines;
+    for (i, v) in src.release_lines.iter().enumerate() {
+        dst.release_lines[i] += v;
+    }
+
+    for (year, y) in src.years {
+        let e = dst.years.entry(year).or_default();
+        e.overall += y.overall;
+        e.size += y.size;
+        for (i, v) in y.ohpc.iter().enumerate() {
+            e.ohpc[i] += v;
+        }
+        for (ip, releases) in y.ipv4 {
+            *e.ipv4.entry(ip).or_insert(0) |= releases;
+        }
+        for (ip, releases) in y.ipv6 {
+            *e.ipv6.entry(ip).or_insert(0) |= releases;
+        }
+    }
+
+    for (key, m) in src.months {
+        let e = dst.months.entry(key).or_default();
+        e.overall += m.overall;
+        e.size += m.size;
+        for (i, v) in m.ohpc.iter().enumerate() {
+            e.ohpc[i] += v;
+        }
+        for (ip, stats) in m.ipv4 {
+            let slot = e.ipv4.entry(ip).or_default();
+            slot.requests += stats.requests;
+            slot.releases |= stats.releases;
+        }
+        for (ip, stats) in m.ipv6 {
+            let slot = e.ipv6.entry(ip).or_default();
+            slot.requests += stats.requests;
+            slot.releases |= stats.releases;
+        }
+    }
+
+    for (year, c) in src.ohpc1 {
+        let e = dst.ohpc1.entry(year).or_default();
+        for (i, v) in c.iter().enumerate() {
+            e[i] += v;
+        }
+    }
+    for (year, c) in src.ohpc2 {
+        let e = dst.ohpc2.entry(year).or_default();
+        for (i, v) in c.iter().enumerate() {
+            e[i] += v;
+        }
+    }
+    for (year, c) in src.ohpc3 {
+        let e = dst.ohpc3.entry(year).or_default();
+        for (i, v) in c.iter().enumerate() {
+            e[i] += v;
+        }
+    }
+    for (year, c) in src.ohpc4 {
+        let e = dst.ohpc4.entry(year).or_default();
+        for (i, v) in c.iter().enumerate() {
+            e[i] += v;
+        }
+    }
+    for (year, c) in src.types {
+        let e = dst.types.entry(year).or_default();
+        for (i, v) in c.iter().enumerate() {
+            e[i] += v;
+        }
+    }
+
+    for (name, per_year) in src.libdnf {
+        let e = dst.libdnf.entry(name).or_default();
+        for (year, count) in per_year {
+            *e.entry(year).or_insert(0) += count;
+        }
+    }
+}
+
+// Bump this whenever a change to the parsing alters the counts a given log
+// file produces. A cache entry written by a different version is ignored and
+// the file is parsed again, so forgetting to bump it is the one way to get
+// stale numbers out of this program.
+const CACHE_VERSION: u32 = 1;
+const CACHE_MAGIC: &[u8; 8] = b"OHPCLOG\0";
+
+struct Enc(Vec<u8>);
+
+impl Enc {
+    fn u8(&mut self, v: u8) {
+        self.0.push(v);
+    }
+    fn u32(&mut self, v: u32) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn u64(&mut self, v: u64) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn i64(&mut self, v: i64) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn u128(&mut self, v: u128) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn bytes(&mut self, b: &[u8]) {
+        self.u64(b.len() as u64);
+        self.0.extend_from_slice(b);
+    }
+}
+
+struct Dec<'a> {
+    b: &'a [u8],
+    pos: usize,
+}
+
+// Every read is checked and returns None on a short or malformed entry. A
+// cache file that cannot be decoded is treated as absent, never as an error
+// and never as a panic, so a truncated or corrupt entry only costs a reparse.
+impl<'a> Dec<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        let out = self.b.get(self.pos..end)?;
+        self.pos = end;
+        Some(out)
+    }
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn i64(&mut self) -> Option<i64> {
+        Some(i64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn u128(&mut self) -> Option<u128> {
+        Some(u128::from_le_bytes(self.take(16)?.try_into().ok()?))
+    }
+    // A corrupt length must not make the program reserve gigabytes, so a
+    // count is only accepted when at least that many bytes are still left.
+    fn count(&mut self) -> Option<usize> {
+        let n = usize::try_from(self.u64()?).ok()?;
+        match n <= self.b.len().saturating_sub(self.pos) {
+            true => Some(n),
+            false => None,
+        }
+    }
+    fn bytes(&mut self) -> Option<&'a [u8]> {
+        let n = self.count()?;
+        self.take(n)
+    }
+}
+
+fn encode_counts(counts: &ChunkCounts) -> Vec<u8> {
+    let mut e = Enc(Vec::with_capacity(1 << 20));
+    e.u64(counts.lines as u64);
+    for v in counts.release_lines {
+        e.u64(v as u64);
+    }
+
+    e.u64(counts.years.len() as u64);
+    for (year, y) in &counts.years {
+        e.i64(*year);
+        e.i64(y.overall);
+        e.u64(y.size);
+        for v in y.ohpc {
+            e.i64(v);
+        }
+        e.u64(y.ipv4.len() as u64);
+        for (ip, releases) in &y.ipv4 {
+            e.u32(*ip);
+            e.u8(*releases);
+        }
+        e.u64(y.ipv6.len() as u64);
+        for (ip, releases) in &y.ipv6 {
+            e.u128(*ip);
+            e.u8(*releases);
+        }
+    }
+
+    e.u64(counts.months.len() as u64);
+    for ((year, month), m) in &counts.months {
+        e.i64(*year);
+        e.i64(*month);
+        e.i64(m.overall);
+        e.u64(m.size);
+        for v in m.ohpc {
+            e.i64(v);
+        }
+        e.u64(m.ipv4.len() as u64);
+        for (ip, stats) in &m.ipv4 {
+            e.u32(*ip);
+            e.i64(stats.requests);
+            e.u8(stats.releases);
+        }
+        e.u64(m.ipv6.len() as u64);
+        for (ip, stats) in &m.ipv6 {
+            e.u128(*ip);
+            e.i64(stats.requests);
+            e.u8(stats.releases);
+        }
+    }
+
+    for map in [&counts.ohpc1, &counts.ohpc2, &counts.ohpc4] {
+        e.u64(map.len() as u64);
+        for (year, c) in map.iter() {
+            e.i64(*year);
+            for v in c {
+                e.i64(*v);
+            }
+        }
+    }
+    for map in [&counts.ohpc3, &counts.types] {
+        e.u64(map.len() as u64);
+        for (year, c) in map.iter() {
+            e.i64(*year);
+            for v in c {
+                e.i64(*v);
+            }
+        }
+    }
+
+    e.u64(counts.libdnf.len() as u64);
+    for (name, per_year) in &counts.libdnf {
+        e.bytes(name.as_bytes());
+        e.u64(per_year.len() as u64);
+        for (year, count) in per_year {
+            e.i64(*year);
+            e.i64(*count);
+        }
+    }
+
+    e.0
+}
+
+fn decode_counts(d: &mut Dec) -> Option<ChunkCounts> {
+    let mut counts = ChunkCounts {
+        lines: usize::try_from(d.u64()?).ok()?,
+        ..Default::default()
+    };
+    for slot in counts.release_lines.iter_mut() {
+        *slot = usize::try_from(d.u64()?).ok()?;
+    }
+
+    for _ in 0..d.count()? {
+        let year = d.i64()?;
+        let mut y = YearCounts {
+            overall: d.i64()?,
+            size: d.u64()?,
+            ..Default::default()
+        };
+        for slot in y.ohpc.iter_mut() {
+            *slot = d.i64()?;
+        }
+        for _ in 0..d.count()? {
+            y.ipv4.insert(d.u32()?, d.u8()?);
+        }
+        for _ in 0..d.count()? {
+            y.ipv6.insert(d.u128()?, d.u8()?);
+        }
+        counts.years.insert(year, y);
+    }
+
+    for _ in 0..d.count()? {
+        let year = d.i64()?;
+        let month = d.i64()?;
+        let mut m = MonthCounts {
+            overall: d.i64()?,
+            size: d.u64()?,
+            ..Default::default()
+        };
+        for slot in m.ohpc.iter_mut() {
+            *slot = d.i64()?;
+        }
+        for _ in 0..d.count()? {
+            let ip = d.u32()?;
+            m.ipv4.insert(ip, IpStats {
+                requests: d.i64()?,
+                releases: d.u8()?,
+            });
+        }
+        for _ in 0..d.count()? {
+            let ip = d.u128()?;
+            m.ipv6.insert(ip, IpStats {
+                requests: d.i64()?,
+                releases: d.u8()?,
+            });
+        }
+        counts.months.insert((year, month), m);
+    }
+
+    for map in [&mut counts.ohpc1, &mut counts.ohpc2, &mut counts.ohpc4] {
+        for _ in 0..d.count()? {
+            let year = d.i64()?;
+            map.insert(year, [d.i64()?, d.i64()?]);
+        }
+    }
+    for map in [&mut counts.ohpc3, &mut counts.types] {
+        for _ in 0..d.count()? {
+            let year = d.i64()?;
+            map.insert(year, [d.i64()?, d.i64()?, d.i64()?]);
+        }
+    }
+
+    for _ in 0..d.count()? {
+        let name = String::from_utf8(d.bytes()?.to_vec()).ok()?;
+        let mut per_year = FxHashMap::default();
+        for _ in 0..d.count()? {
+            per_year.insert(d.i64()?, d.i64()?);
+        }
+        counts.libdnf.insert(name, per_year);
+    }
+
+    Some(counts)
+}
+
+// Identity of an input file. A cache entry is only used when all of these
+// still match, so a log that was rotated, appended to or replaced is parsed
+// again. The daily log still grows, so it is reparsed every run; the files
+// that make up the bulk of the input no longer are.
+struct FileId {
+    len: u64,
+    mtime_secs: i64,
+    mtime_nanos: u32,
+    inode: u64,
+}
+
+fn file_id(meta: &std::fs::Metadata) -> FileId {
+    use std::os::unix::fs::MetadataExt;
+    FileId {
+        len: meta.len(),
+        mtime_secs: meta.mtime(),
+        mtime_nanos: meta.mtime_nsec() as u32,
+        inode: meta.ino(),
+    }
+}
+
+// The cache file is named after a hash of the input path so that logs from
+// different directories cannot collide, and the path is stored in the entry
+// as well so a hash collision is caught rather than silently believed.
+fn cache_path(cache_dir: &Path, input: &str) -> PathBuf {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for b in input.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    cache_dir.join(format!("{hash:016x}.counts"))
+}
+
+fn read_cache(cache_dir: &Path, input: &str, id: &FileId) -> Option<ChunkCounts> {
+    let raw = fs::read(cache_path(cache_dir, input)).ok()?;
+    let mut d = Dec { b: &raw, pos: 0 };
+
+    if d.take(CACHE_MAGIC.len())? != CACHE_MAGIC {
+        return None;
+    }
+    if d.u32()? != CACHE_VERSION {
+        return None;
+    }
+    if d.bytes()? != input.as_bytes() {
+        return None;
+    }
+    if d.u64()? != id.len
+        || d.i64()? != id.mtime_secs
+        || d.u32()? != id.mtime_nanos
+        || d.u64()? != id.inode
+    {
+        return None;
+    }
+
+    decode_counts(&mut d)
+}
+
+fn write_cache(
+    cache_dir: &Path,
+    input: &str,
+    id: &FileId,
+    counts: &ChunkCounts,
+) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(cache_dir)?;
+
+    let mut e = Enc(Vec::new());
+    e.0.extend_from_slice(CACHE_MAGIC);
+    e.u32(CACHE_VERSION);
+    e.bytes(input.as_bytes());
+    e.u64(id.len);
+    e.i64(id.mtime_secs);
+    e.u32(id.mtime_nanos);
+    e.u64(id.inode);
+    e.0.extend_from_slice(&encode_counts(counts));
+
+    write_atomic(&cache_path(cache_dir, input), &e.0)
 }
 
 fn merge_chunk(counts: ChunkCounts) {
@@ -797,6 +1205,8 @@ fn main() {
     let pool = rayon::ThreadPoolBuilder::new().build().unwrap();
     let max_in_flight = 2 * pool.current_num_threads();
 
+    let cache_dir = params.cache_directory.as_ref().map(PathBuf::from);
+
     for input in params.access_log.clone().into_iter() {
         let pb = ProgressBar::new(0);
         pb.set_style(spinner_style.clone());
@@ -807,7 +1217,27 @@ fn main() {
                 process::exit(1);
             }
         };
+        // A rotated log never changes again, so its counters are taken from
+        // the cache and the file itself is not read at all.
+        let id = access_log.metadata().as_ref().map(file_id).ok();
+        if let (Some(dir), Some(id)) = (&cache_dir, &id) {
+            if let Some(counts) = read_cache(dir, &input, id) {
+                print_step(format!("Using the cached counts for '{input}'"));
+                merge_chunk(counts);
+                continue;
+            }
+        }
+
         print_step(format!("Using '{input:}' as input"));
+
+        // With a cache the chunks are folded into one ChunkCounts per file so
+        // that it can be stored; without one they go straight into the
+        // globals as before, which keeps the default memory profile the same.
+        let file_counts = cache_dir
+            .as_ref()
+            .and(id.as_ref())
+            .map(|_| Mutex::new(ChunkCounts::default()));
+        let accumulator = file_counts.as_ref();
 
         pool.in_place_scope(|scope| {
             let mut s = Vec::with_capacity(CHUNK_SIZE);
@@ -861,13 +1291,26 @@ fn main() {
                         }
                         process_line(i, &mut counts);
                     }
-                    merge_chunk(counts);
+                    match accumulator {
+                        Some(acc) => merge_counts(&mut acc.lock().unwrap(), counts),
+                        _ => merge_chunk(counts),
+                    }
                     CHUNKS_IN_FLIGHT.fetch_sub(1, Ordering::Release);
                 });
                 s = next_s;
             }
             pb.finish();
         });
+
+        if let (Some(dir), Some(id), Some(acc)) = (&cache_dir, &id, file_counts) {
+            let counts = acc.into_inner().unwrap_or_default();
+            // A cache that cannot be written only costs the next run some
+            // time, so it must not stop this one from publishing its page.
+            if let Err(e) = write_cache(dir, &input, id, &counts) {
+                eprintln!("Writing the cache entry for '{input}' failed: {e}");
+            }
+            merge_chunk(counts);
+        }
     }
     if let Err(e) = create_plots(params, start) {
         println!("Error creating diagrams: {e}");
@@ -919,8 +1362,11 @@ fn format_bytes(v: f64) -> String {
 // reader sees either the previous file or the complete new one, and a failed
 // run leaves the previous file untouched.
 fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    // The process id keeps two runs writing the same destination from
+    // interleaving into one temporary file and renaming the result into
+    // place, which would publish exactly the corrupt file this avoids.
     let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(".tmp");
+    tmp.push(format!(".{}.tmp", process::id()));
     let tmp = PathBuf::from(tmp);
 
     let result = (|| -> std::io::Result<()> {

@@ -163,6 +163,64 @@ fi
 
 rm -rf "${SVG_DEST}"
 
+# The per input file counter cache has to be invisible in the results: a run
+# that reuses it must produce exactly what a run that parses the log does.
+CACHE_DIR=$(mktemp -d)
+CACHE_LOG=$(mktemp -d)
+COLD=$(mktemp -d)
+WARM=$(mktemp -d)
+cp tests/access_log "${CACHE_LOG}/access_log"
+
+"${OHPC_LOG_ANALYZER}" --no-svg --cache-directory "${CACHE_DIR}" \
+	--output-directory "${COLD}" "${CACHE_LOG}/access_log"
+"${OHPC_LOG_ANALYZER}" --no-svg --cache-directory "${CACHE_DIR}" \
+	--output-directory "${WARM}" "${CACHE_LOG}/access_log"
+
+if ! diff -q "${DEST}/stats.json" "${COLD}/stats.json"; then
+	echo "ERROR: the run that filled the cache disagrees with the plain run"
+	exit 1
+fi
+if ! diff -q "${DEST}/stats.json" "${WARM}/stats.json"; then
+	echo "ERROR: the run that reused the cache disagrees with the plain run"
+	exit 1
+fi
+
+# Appending to a log must invalidate its entry rather than report yesterday's
+# numbers for a file that has grown since.
+cat tests/access_log >>"${CACHE_LOG}/access_log"
+GROWN=$(mktemp -d)
+PLAIN_GROWN=$(mktemp -d)
+"${OHPC_LOG_ANALYZER}" --no-svg --cache-directory "${CACHE_DIR}" \
+	--output-directory "${GROWN}" "${CACHE_LOG}/access_log"
+"${OHPC_LOG_ANALYZER}" --no-svg --output-directory "${PLAIN_GROWN}" \
+	"${CACHE_LOG}/access_log"
+
+if ! diff -q "${PLAIN_GROWN}/stats.json" "${GROWN}/stats.json"; then
+	echo "ERROR: a log that grew was served from a stale cache entry"
+	exit 1
+fi
+if diff -q "${WARM}/stats.json" "${GROWN}/stats.json" >/dev/null; then
+	echo "ERROR: the counts did not change although the log doubled"
+	exit 1
+fi
+
+# A truncated or corrupt entry must cost a reparse, never a wrong answer.
+CORRUPT=$(mktemp -d)
+for ENTRY in "${CACHE_DIR}"/*.counts; do
+	head -c 200 "${ENTRY}" >"${ENTRY}.part"
+	mv "${ENTRY}.part" "${ENTRY}"
+done
+"${OHPC_LOG_ANALYZER}" --no-svg --cache-directory "${CACHE_DIR}" \
+	--output-directory "${CORRUPT}" "${CACHE_LOG}/access_log"
+
+if ! diff -q "${PLAIN_GROWN}/stats.json" "${CORRUPT}/stats.json"; then
+	echo "ERROR: a corrupt cache entry changed the results"
+	exit 1
+fi
+
+rm -rf "${CACHE_DIR}" "${CACHE_LOG}" "${COLD}" "${WARM}" "${GROWN}" \
+	"${PLAIN_GROWN}" "${CORRUPT}"
+
 jq '.' "${DEST}"/stats.json
 
 rm -rf "${DEST}"
