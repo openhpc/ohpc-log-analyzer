@@ -1,6 +1,5 @@
 extern crate chrono;
 extern crate indicatif;
-extern crate regex;
 extern crate serde;
 
 use rustc_hash::FxHashMap;
@@ -23,6 +22,7 @@ use std::sync::atomic::{
 };
 use std::sync::{
     Arc,
+    LazyLock,
     RwLock,
 };
 use std::time::Instant;
@@ -51,9 +51,27 @@ use plotly::{
     Plot,
     Scatter,
 };
+use memchr::memmem::Finder;
 use rayon::prelude::*;
-use regex::bytes::Regex;
 use serde::Serialize;
+
+// Substring searches on every log line are the hot path, so the patterns are
+// compiled once into SIMD-accelerated finders instead of being scanned with
+// slice::windows(), which compares byte by byte.
+static F_GET: LazyLock<Finder> = LazyLock::new(|| Finder::new(b"GET"));
+static F_PNG: LazyLock<Finder> = LazyLock::new(|| Finder::new(b"png"));
+static F_GIF: LazyLock<Finder> = LazyLock::new(|| Finder::new(b"gif"));
+static F_OHPC_1_3: LazyLock<Finder> = LazyLock::new(|| Finder::new(b"/ohpc-1.3/"));
+static F_OPENHPC: LazyLock<Finder> = LazyLock::new(|| Finder::new(b"/OpenHPC/"));
+static F_SLE_12: LazyLock<Finder> = LazyLock::new(|| Finder::new(b"SLE_12"));
+static F_CENTOS_7: LazyLock<Finder> = LazyLock::new(|| Finder::new(b"CentOS_7"));
+static F_CENTOS_8: LazyLock<Finder> = LazyLock::new(|| Finder::new(b"CentOS_8"));
+static F_LEAP_15: LazyLock<Finder> = LazyLock::new(|| Finder::new(b"Leap_15"));
+static F_EL_8: LazyLock<Finder> = LazyLock::new(|| Finder::new(b"EL_8"));
+static F_EL_9: LazyLock<Finder> = LazyLock::new(|| Finder::new(b"EL_9"));
+static F_EL_10: LazyLock<Finder> = LazyLock::new(|| Finder::new(b"EL_10"));
+static F_OPENEULER_22: LazyLock<Finder> = LazyLock::new(|| Finder::new(b"openEuler_22.03"));
+static F_OPENEULER_24: LazyLock<Finder> = LazyLock::new(|| Finder::new(b"openEuler_24.03"));
 
 static OVERALL: AtomicUsize = AtomicUsize::new(0);
 static OHPC_1: AtomicUsize = AtomicUsize::new(0);
@@ -242,7 +260,7 @@ fn last_newline(s: &[u8]) -> usize {
     s.len()
 }
 
-fn count_type(elements: &[String], year: i64) {
+fn count_type(elements: &[&str], year: i64) {
     if elements.len() < 7 {
         return;
     }
@@ -280,7 +298,7 @@ fn count_type(elements: &[String], year: i64) {
     }
 }
 
-fn count_libdnf(elements: &[String], year: i64) {
+fn count_libdnf(elements: &[&str], year: i64) {
     if elements.len() < 12 {
         return;
     }
@@ -288,34 +306,46 @@ fn count_libdnf(elements: &[String], year: i64) {
         return;
     }
 
-    let user_agent_long = elements[12..].join(" ");
-    let user_agent_vec: Vec<_> = user_agent_long.split(';').map(|s| s.to_string()).collect();
-    let mut user_agent_short = user_agent_vec[0].clone();
+    // The distribution name is the first ';'-delimited field of the user
+    // agent, minus the trailing version number and the leading '(' -- so
+    // "(AlmaLinux 8.9; generic; ..." becomes "AlmaLinux". Collect the words
+    // of that field rather than joining the whole tail into a String first.
+    let mut words: Vec<&str> = Vec::with_capacity(4);
+    for element in &elements[12..] {
+        match element.find(';') {
+            Some(i) => {
+                words.push(&element[..i]);
+                break;
+            }
+            _ => words.push(element),
+        }
+    }
     // Drop the trailing version number. Without it there is no name to count.
-    match user_agent_short.rfind(' ') {
-        Some(space) => user_agent_short.truncate(space),
-        _ => return,
+    if words.len() < 2 {
+        return;
+    }
+    words.pop();
+    let mut user_agent_short = String::with_capacity(32);
+    for (i, word) in words.iter().enumerate() {
+        if i > 0 {
+            user_agent_short.push(' ');
+        }
+        user_agent_short.push_str(word);
     }
     // Drop the leading '('. Indexing by byte would split a multi-byte char.
-    let mut user_agent = match user_agent_short.char_indices().nth(1) {
+    let user_agent = match user_agent_short.char_indices().nth(1) {
         Some((i, _)) => &user_agent_short[i..],
         _ => return,
     };
     if user_agent.is_empty() {
         return;
     }
-    let change_name = FxHashMap::from_iter([
-        (
-            "Red Hat Enterprise Linux Server",
-            "Red Hat Enterprise Linux",
-        ),
-        ("CentOS AutoSD", "CentOS Linux"),
-        ("CentOS release 8", "CentOS Linux"),
-        ("RockyLinux", "Rocky Linux"),
-    ]);
-    if change_name.contains_key(&user_agent) {
-        user_agent = change_name[&user_agent];
-    }
+    let user_agent = match user_agent {
+        "Red Hat Enterprise Linux Server" => "Red Hat Enterprise Linux",
+        "CentOS AutoSD" | "CentOS release 8" => "CentOS Linux",
+        "RockyLinux" => "Rocky Linux",
+        other => other,
+    };
 
     let mut data = LIBDNF_RESULTS.write().unwrap();
     for result in data.as_mut_slice() {
@@ -332,29 +362,15 @@ fn count_libdnf(elements: &[String], year: i64) {
 }
 
 fn update_distributions_ohpc_3(s: &[u8], year: i64) {
-    let leap_15 = "Leap_15".as_bytes();
-    let el_9 = "EL_9".as_bytes();
-    let openeuler = "openEuler_22.03".as_bytes();
     let mut leap_15_found = false;
     let mut el_9_found = false;
     let mut openeuler_found = false;
-    let search_leap = s
-        .windows(leap_15.len())
-        .position(|window| window == leap_15);
-    if search_leap.is_some() {
+    if F_LEAP_15.find(s).is_some() {
         leap_15_found = true;
-    } else {
-        let search_centos = s.windows(el_9.len()).position(|window| window == el_9);
-        if search_centos.is_some() {
-            el_9_found = true;
-        } else {
-            let search_el = s
-                .windows(openeuler.len())
-                .position(|window| window == openeuler);
-            if search_el.is_some() {
-                openeuler_found = true;
-            }
-        }
+    } else if F_EL_9.find(s).is_some() {
+        el_9_found = true;
+    } else if F_OPENEULER_22.find(s).is_some() {
+        openeuler_found = true;
     }
     if !el_9_found && !leap_15_found && !openeuler_found {
         return;
@@ -392,20 +408,12 @@ fn update_distributions_ohpc_3(s: &[u8], year: i64) {
 }
 
 fn update_distributions_ohpc_4(s: &[u8], year: i64) {
-    let el_10 = "EL_10".as_bytes();
-    let openeuler = "openEuler_24.03".as_bytes();
     let mut el_10_found = false;
     let mut openeuler_found = false;
-    let search_el = s.windows(el_10.len()).position(|window| window == el_10);
-    if search_el.is_some() {
+    if F_EL_10.find(s).is_some() {
         el_10_found = true;
-    } else {
-        let search_openeuler = s
-            .windows(openeuler.len())
-            .position(|window| window == openeuler);
-        if search_openeuler.is_some() {
-            openeuler_found = true;
-        }
+    } else if F_OPENEULER_24.find(s).is_some() {
+        openeuler_found = true;
     }
     if !el_10_found && !openeuler_found {
         return;
@@ -463,8 +471,8 @@ fn process_line(s: &[u8]) {
         Ok(line) => line,
         _ => return,
     };
-    let elements: Vec<_> = line.split(' ').map(|s| s.to_string()).collect();
-    OVERALL.fetch_add(1, Ordering::SeqCst);
+    let elements: Vec<&str> = line.split(' ').collect();
+    OVERALL.fetch_add(1, Ordering::Relaxed);
     // elements[3] holds the timestamp, so four elements are needed.
     if elements.len() < 4 {
         // Skip incomplete lines
@@ -489,30 +497,17 @@ fn process_line(s: &[u8]) {
     let mut ohpc_2 = false;
     let mut ohpc_3 = false;
     let mut ohpc_4 = false;
-    let substring_1 = "/ohpc-1.3/".as_bytes();
-    let search_1 = s
-        .windows(substring_1.len())
-        .position(|window| window == substring_1);
-    if let Some(search_result) = search_1 {
-        OHPC_1.fetch_add(1, Ordering::SeqCst);
+    if let Some(search_result) = F_OHPC_1_3.find(s) {
+        OHPC_1.fetch_add(1, Ordering::Relaxed);
         ohpc_1 = true;
-        let start = search_result + substring_1.len();
-        let sle_12 = "SLE_12".as_bytes();
-        let centos_7 = "CentOS_7".as_bytes();
+        let start = search_result + "/ohpc-1.3/".len();
+        let rest = &s[start..];
         let mut centos_7_found = false;
         let mut sle_12_found = false;
-        let search_centos = s[start..]
-            .windows(centos_7.len())
-            .position(|window| window == centos_7);
-        if search_centos.is_some() {
+        if F_CENTOS_7.find(rest).is_some() {
             centos_7_found = true;
-        } else {
-            let search_sle = s[start..]
-                .windows(sle_12.len())
-                .position(|window| window == sle_12);
-            if search_sle.is_some() {
-                sle_12_found = true;
-            }
+        } else if F_SLE_12.find(rest).is_some() {
+            sle_12_found = true;
         }
 
         let mut data = OHPC1_RESULTS.write().unwrap();
@@ -542,43 +537,23 @@ fn process_line(s: &[u8]) {
             }
         }
     }
-    let substring_ohpc = "/OpenHPC/".as_bytes();
-    let search_ohpc = s
-        .windows(substring_ohpc.len())
-        .position(|window| window == substring_ohpc);
+    let search_ohpc = F_OPENHPC.find(s);
 
     if let Some(search_result) = search_ohpc {
         let substring_2 = "2/".as_bytes();
-        let start = search_result + substring_ohpc.len();
+        let start = search_result + "/OpenHPC/".len();
         // A line truncated right after "/OpenHPC/" has no release digit.
         let release = s.get(start..start + 2).unwrap_or_default();
         if release == substring_2 {
-            let leap_15 = "Leap_15".as_bytes();
-            let centos_8 = "CentOS_8".as_bytes();
-            let el_8 = "EL_8".as_bytes();
             let mut leap_15_found = false;
             let mut el_8_found = false;
-            OHPC_2.fetch_add(1, Ordering::SeqCst);
+            OHPC_2.fetch_add(1, Ordering::Relaxed);
             ohpc_2 = true;
-            let search_leap = s[start + 2..]
-                .windows(leap_15.len())
-                .position(|window| window == leap_15);
-            if search_leap.is_some() {
+            let rest = &s[start + 2..];
+            if F_LEAP_15.find(rest).is_some() {
                 leap_15_found = true;
-            } else {
-                let search_centos = s[start + 2..]
-                    .windows(centos_8.len())
-                    .position(|window| window == centos_8);
-                if search_centos.is_some() {
-                    el_8_found = true;
-                } else {
-                    let search_el = s[start + 2..]
-                        .windows(el_8.len())
-                        .position(|window| window == el_8);
-                    if search_el.is_some() {
-                        el_8_found = true;
-                    }
-                }
+            } else if F_CENTOS_8.find(rest).is_some() || F_EL_8.find(rest).is_some() {
+                el_8_found = true;
             }
             {
                 let mut data = OHPC2_RESULTS.write().unwrap();
@@ -611,13 +586,13 @@ fn process_line(s: &[u8]) {
         }
         let substring_3 = "3/".as_bytes();
         if release == substring_3 {
-            OHPC_3.fetch_add(1, Ordering::SeqCst);
+            OHPC_3.fetch_add(1, Ordering::Relaxed);
             ohpc_3 = true;
             update_distributions_ohpc_3(&s[start + 2..], year);
         }
         let substring_4 = "4/".as_bytes();
         if release == substring_4 {
-            OHPC_4.fetch_add(1, Ordering::SeqCst);
+            OHPC_4.fetch_add(1, Ordering::Relaxed);
             ohpc_4 = true;
             update_distributions_ohpc_4(&s[start + 2..], year);
         }
@@ -842,7 +817,6 @@ fn main() {
         .unwrap()
         .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ");
     let pool = rayon::ThreadPoolBuilder::new().build().unwrap();
-    let re = Regex::new(r"(.*GET.*){2,}").unwrap();
 
     for input in params.access_log.clone().into_iter() {
         let pb = ProgressBar::new(0);
@@ -890,16 +864,15 @@ fn main() {
 
                 // Move our string into a rayon thread.
                 let data = s;
-                let re = re.clone();
                 scope.spawn(move |_| {
                     let d_s = data[..last_newline].split(|c| *c == b'\n');
 
                     for i in d_s {
                         // Skip binary files (images) in a single pass
-                        if i.windows(3).any(|window| window == b"png" || window == b"gif") {
+                        if F_PNG.find(i).is_some() || F_GIF.find(i).is_some() {
                             continue;
                         }
-                        if re.is_match(i) {
+                        if F_GET.find_iter(i).nth(1).is_some() {
                             // Skip broken lines with two or more "GET"s
                             continue;
                         }
