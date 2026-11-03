@@ -1375,14 +1375,24 @@ fn fill_country_results(params: &Args) -> Result<(), Box<dyn std::error::Error>>
         }
     };
 
+    // maxminddb::geoip2::Country deserializes the whole record, including the
+    // continent and every localized name, just to reach country.iso_code.
+    // Decoding only the one field that is used skips all of that.
+    #[derive(serde::Deserialize)]
+    struct IsoCode<'a> {
+        iso_code: Option<&'a str>,
+    }
+    #[derive(serde::Deserialize)]
+    struct CountryRecord<'a> {
+        #[serde(borrow)]
+        country: Option<IsoCode<'a>>,
+    }
+
     fn lookup(reader: &maxminddb::Reader<Vec<u8>>, ip: IpAddr) -> String {
-        match reader
-            .lookup(ip)
-            .and_then(|r| r.decode::<maxminddb::geoip2::Country>())
-        {
+        match reader.lookup(ip).and_then(|r| r.decode::<CountryRecord>()) {
             Ok(Some(c)) => c
                 .country
-                .iso_code
+                .and_then(|c| c.iso_code)
                 .map_or("N/A".to_string(), |iso| iso.to_string()),
             _ => "N/A".to_string(),
         }
