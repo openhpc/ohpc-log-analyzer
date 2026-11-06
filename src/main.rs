@@ -253,11 +253,46 @@ static LIBDNF_RESULTS: RwLock<Vec<ResultLIBDNF>> = RwLock::new(Vec::new());
 static COUNTRY_RESULTS: RwLock<Vec<ResultCountry>> = RwLock::new(Vec::new());
 static TYPE_RESULTS: RwLock<Vec<ResultType>> = RwLock::new(Vec::new());
 
-static HTML_HEADER: &str =
-    "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\" /></head><body>   <div>
-<script src=\"https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-svg.js\"></script>
-<script src=\"https://cdn.plot.ly/plotly-2.12.1.min.js\"></script>";
-static HTML_FOOTER: &str = "</body></html>";
+// site.css, favicon.ico and the logo are installed under /repos by the
+// openhpc-infrastructure Ansible role, and /stats is served by the same
+// Apache instance, so the absolute paths below resolve on the live site.
+static HTML_HEADER: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="description" content="Download statistics of the OpenHPC package repositories" />
+<title>OpenHPC Download Statistics</title>
+<link rel="icon" type="image/x-icon" href="/.files/favicon.ico" />
+<link rel="stylesheet" type="text/css" href="/.files/site.css" />
+</head>
+<body>
+<header class="site-header">
+<div class="site-header-inner">
+<a class="site-logo" href="/">
+<img src="/HEADER.images/ohpc_logo.png" alt="OpenHPC" />
+</a>
+<nav class="site-nav" aria-label="OpenHPC links">
+<a href="https://openhpc.community/">openhpc.community</a>
+<a href="https://github.com/openhpc/ohpc">GitHub</a>
+<a href="https://lists.openhpc.community/">Mailing Lists</a>
+<a href="https://github.com/openhpc/ohpc/wiki/System-Registry">System Registry</a>
+<a href="/results/">Test Results</a>
+<a href="/stats/">Statistics</a>
+</nav>
+</div>
+</header>
+<div>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-svg.js"></script>
+<script src="https://cdn.plot.ly/plotly-2.12.1.min.js"></script>"#;
+static HTML_FOOTER: &str = r#"
+<footer class="site-footer">
+<a href="https://openhpc.community/">OpenHPC</a> package repository &middot;
+<a href="/results/">Test Results</a> &middot;
+<a href="/stats/">Download Statistics</a> &middot;
+<a href="https://lists.openhpc.community/">Mailing Lists</a>
+</footer>
+</body></html>"#;
 
 fn last_newline(s: &[u8]) -> usize {
     let mut i = s.len() - 1;
