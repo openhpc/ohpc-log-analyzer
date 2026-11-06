@@ -285,8 +285,11 @@ static HTML_HEADER: &str = r#"<!doctype html>
 <div>
 <script src="https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-svg.js"></script>
 <script src="https://cdn.plot.ly/plotly-2.12.1.min.js"></script>"#;
+// @@GENERATED@@ is replaced at run time, in the same way the Ansible role
+// fills @@VERSION@@ in HEADER.tmpl.
 static HTML_FOOTER: &str = r#"
 <footer class="site-footer">
+<div>Generated on @@GENERATED@@</div>
 <a href="https://openhpc.community/">OpenHPC</a> package repository &middot;
 <a href="/results/">Test Results</a> &middot;
 <a href="/stats/">Download Statistics</a> &middot;
@@ -2739,10 +2742,10 @@ fn create_plots(params: Args, start: Instant) -> Result<(), Box<dyn std::error::
 
     let duration = start.elapsed();
     let timestamp = chrono::Utc::now().to_rfc2822();
-    page.push_str(&format!(
-        "<center>Generated on {timestamp}. Runtime: {duration:?}</center>"
+    page.push_str(&HTML_FOOTER.replace(
+        "@@GENERATED@@",
+        &format!("{timestamp}. Runtime: {duration:?}"),
     ));
-    page.push_str(HTML_FOOTER);
 
     write_atomic(
         &Path::new(&params.output_directory).join(&params.html_output),
