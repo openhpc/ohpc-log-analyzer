@@ -8,7 +8,7 @@ chrono = "0.4.45"
 clap = { version = "4.3.24", features = ["derive"] }
 console = "0.16.3"
 indicatif = "0.18.4"
-maxminddb = "0.32.0"
+maxminddb = "0.33.0"
 memchr = "2.8"
 plotly = "0.14"
 plotters = { version = "0.3", default-features = false, features = ["svg_backend", "line_series"] }
